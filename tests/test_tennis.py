@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 from matchlab import ai_check, tennis_forecast as tf, tracker
@@ -36,6 +37,24 @@ class PointModel(unittest.TestCase):
 
 
 class Forecast(unittest.TestCase):
+    def test_ratings_pick_up_the_local_supplement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive(root)
+            original = tf.ratings(root, "wta")
+            supplemental = root / tf.LOCAL_RESULTS / "wta"
+            supplemental.mkdir(parents=True)
+            (supplemental / "wta_matches_2026_supplement.csv").write_text(
+                HEADER + ",match_date,winner_source_name\n"
+                "t31,Testville,Hard,I,20261116,1,1,Ann Strong,2,Bea Weak,6-3 6-4,3,F,"
+                "60,30,12,60,22,10,5,40,20261119,Anna Strong\n",
+                encoding="utf-8",
+            )
+            refreshed = tf.ratings(root, "wta")
+            self.assertEqual(refreshed.matches, original.matches + 1)
+            self.assertEqual(date.fromordinal(refreshed.last_day), date(2026, 11, 19))
+            self.assertEqual(refreshed.find("Anna Strong"), refreshed.find("Ann Strong"))
+
     def test_stronger_player_is_favoured_and_live_score_moves_the_chance(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

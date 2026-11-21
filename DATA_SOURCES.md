@@ -6,7 +6,7 @@ Raw sources and their notices remain under data/raw. Derived CSVs and individual
 | --- | --- | --- | --- | --- | --- |
 | football | 1140 | 2021-08-13 to 2024-05-19 | 0 | 0 | CC0-1.0 |
 | cricket | 1195 | 2008-04-18 to 2026-05-31 | 26835 | 59486 | ODC-BY-1.0 (https://opendatacommons.org/licenses/by/1-0/) |
-| tennis | 4847 | 2023-01-16 to 2024-12-08 | 9322 | 9322 | CC BY-NC-SA 4.0 — noncommercial use; derived CSVs same license |
+| tennis | 14965 | 2020-01-20 to 2026-11-18 | 28204 | 28204 | Noncommercial use under the terms of each source |
 | badminton | 3723 | 2018-01-09 to 2022-10-30 | 98 | 98 | BWF match data CC BY-SA 4.0. ShuttleSet annotations MIT. |
 | baseball | 2424 | 2023-03-30 to 2023-10-01 | 0 | 0 | Retrosheet free reuse with mandatory attribution |
 | rugby | 625 | 2011-02-18 to 2015-07-04 | 0 | 0 | CC0 (publisher DESCRIPTION) |
@@ -52,21 +52,25 @@ The global export uses the [full Cricsheet archive](https://cricsheet.org/downlo
 
 ## tennis (match dashboard)
 
-`data/raw/tennis_tour/`: ATP and WTA singles results 2020 onward (tour level, qualifying, Challenger and ITF), from the same Jeff Sackmann / Tennis Abstract archive retained by Aneeshers, CC BY-NC-SA 4.0 (noncommercial). Downloaded by `tools/fetch_tennis_archive.py`. Live set scores come from ESPN's free scoreboard.
+The base ATP and WTA ratings archive under `data/raw/tennis_tour/` covers singles since 2020. It comes from [Jeff Sackmann / Tennis Abstract, retained by Aneeshers](https://github.com/Aneeshers/tennis-sackmann-archive) under CC BY-NC-SA 4.0. `tools/fetch_tennis_archive.py` downloads the base archive.
+
+The 19 November 2026 supplement in `data/local/tennis_results/` adds 5,862 ATP and 3,481 WTA singles results. It uses [TennisMyLife](https://stats.tennismylife.org/tennis-match-database) for ATP and WTA tour records, ATP qualifying and Challenger main draws. The [ESPN scoreboard](https://www.espn.com/tennis/scoreboard) supplies WTA qualifying and WTA 125 scores and verifies match dates for WTA tour results. The [Sydney scoreboard](https://results.tennisdata.com/en) verifies individual match dates for two ATP Challenger results on 19 November. Each supplemental row retains its source URL. The local supplement is for noncommercial use under source terms.
+
+The latest completed results in this snapshot are 18 November for the ATP main tour, 19 November for ATP Challenger, 15 November for the WTA main tour, and 18 November for WTA 125. Men's Challenger qualifying and women's ITF coverage still end in early June. Some supplemental records have a tournament week as their only date. `data/local/tennis_results/snapshot.json` records coverage and checksums.
 
 ## tennis
 
-[Jeff Sackmann / Tennis Abstract, retained archive by Aneeshers; ATP 2023–2024](https://github.com/Aneeshers/tennis-sackmann-archive)
+[Jeff Sackmann / Tennis Abstract, retained archive by Aneeshers](https://github.com/Aneeshers/tennis-sackmann-archive) and [TennisMyLife](https://stats.tennismylife.org/tennis-match-database)
 
-License: CC BY-NC-SA 4.0 — noncommercial use; derived CSVs same license
+The archive uses CC BY-NC-SA 4.0. Supplemental data follows its source's noncommercial usage terms.
 
 - Only completed best-of-three ATP men's singles; no Grand Slam best-of-five or retirements.
 
-- Source dates are tournament starts. date is conservative result availability (start +14 days); pre_match_date is tournament start. All same-tournament and overlapping unpublished results excluded from features.
+- Archive rows use the tournament start for `pre_match_date` and start +14 days for result availability. Supplemental rows use the published match day for both. Forecast features use results available strictly before the prediction day.
 
 - Aces only where reported; missing aces omitted, never imputed as zero.
 
-- Each match also records tournament, surface, level, round and both players' pre-tournament rank and ranking points (blank where the source has none).
+- Match context includes tournament, surface, level and round. Archive rows also include entry rankings and points where published.
 
 - Point threat: fraction of total match points won, derived from both players' serve points and serve points won. No shot-level context.
 
@@ -116,4 +120,4 @@ License: CC0 (publisher DESCRIPTION)
 
 The badminton sources (ShuttleSet plus its ShuttleSet22 extension) identify player A as the match winner. Import orientation is alphabetical, and historical contexts include both orientations; winner-coded A/B is never an input feature. Duplicate date/player fixtures across releases are removed. Only the men's singles subset enters this context. Point totals come from observed legal terminal scoreboards, checked against the last-point and match winners; missing stroke rows are never fabricated. Original annotations are retained unchanged.
 
-Cricsheet JSON: ODC Attribution 1.0, not the CC BY 4.0 license used for its XML files. Tennis derived data remains CC BY-NC-SA 4.0 and is for noncommercial use. Retrosheet attribution is displayed in the dashboard. Rugby's publisher declares CC0 in DESCRIPTION. ShuttleSet root MIT notice is retained; no video footage is downloaded or reused.
+Cricsheet JSON uses ODC Attribution 1.0. Tennis derived data is for noncommercial use under the terms listed above. Retrosheet attribution is displayed in the dashboard. Rugby's publisher declares CC0 in DESCRIPTION. ShuttleSet root MIT notice is retained; no video footage is downloaded or reused.

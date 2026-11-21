@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from matchlab.cricket_archive import CRICKET_TEAMS
+from matchlab.tennis_forecast import LOCAL_RESULTS, result_files
 
 RAW = ROOT / "data/raw"
 OUT = ROOT / "data/real"
@@ -154,7 +155,12 @@ TENNIS_EXTRA = ["ground", "surface", "level", "round", "team_rank", "opponent_ra
 
 def tennis():
     ms, ps, xs = [], [], []
-    for path in sorted((RAW / "tennis").glob("20*.csv")):
+    supplemental_matches = 0
+    supplement = ROOT / LOCAL_RESULTS / "atp"
+    for path in result_files(ROOT, "atp"):
+        is_supplement = path.parent == supplement
+        if not re.fullmatch(r"atp_matches_20\d{2}(?:_supplement)?\.csv", path.name):
+            continue
         for i, r in enumerate(rows(path)):
             # Homogeneous best-of-three singles. No retirements/walkovers.
             if r["best_of"] != "3" or not r.get("score") or re.search(r"[A-Za-z]", r["score"]):
@@ -164,19 +170,23 @@ def tennis():
             lb = sum(int(a) < int(b) for a, b in sets)
             if wa != 2 or lb > 1:
                 continue
-            start = datetime.strptime(r["tourney_date"], "%Y%m%d").date()
-            available = start + timedelta(days=14)
+            match_day = r.get("match_date") if is_supplement else None
+            if is_supplement and not match_day:
+                continue
+            start = datetime.strptime(match_day or r["tourney_date"], "%Y%m%d").date()
+            available = start if match_day else start + timedelta(days=14)
             w = f"{r['winner_name']} [{r['winner_id']}]"
             l = f"{r['loser_name']} [{r['loser_id']}]"
             a, b = sorted([w, l])
             mid = f"atp-{path.stem}-{i}"
             m = match(mid, available.isoformat(), a, b, wa if a == w else lb, lb if a == w else wa, pre=start.isoformat(), competition="ATP best-of-three")
             first, second = ("winner", "loser") if a == w else ("loser", "winner")
-            # Rankings are the entry rankings published before the tournament.
+            # Use archive entry rankings. Supplemental sources record rankings as of the match.
             m.update(ground=r.get("tourney_name", ""), surface=r.get("surface", ""), level=r.get("tourney_level", ""), round=r.get("round", ""),
-                     team_rank=r.get(first + "_rank", ""), opponent_rank=r.get(second + "_rank", ""),
-                     team_rank_points=r.get(first + "_rank_points", ""), opponent_rank_points=r.get(second + "_rank_points", ""))
+                     team_rank="" if is_supplement else r.get(first + "_rank", ""), opponent_rank="" if is_supplement else r.get(second + "_rank", ""),
+                     team_rank_points="" if is_supplement else r.get(first + "_rank_points", ""), opponent_rank_points="" if is_supplement else r.get(second + "_rank_points", ""))
             ms.append(m)
+            supplemental_matches += is_supplement
             for player, prefix in ((w, "w"), (l, "l")):
                 if r.get(prefix + "_ace", ""):
                     ps.append(dict(zip(PLAYER, [mid, player, player, int(r[prefix + "_ace"])])))
@@ -187,7 +197,24 @@ def tennis():
                 if total > 0 and 0 <= won <= total:
                     for player, other, points in ((w, l, won), (l, w, total - won)):
                         xs.append(dict(zip(INTERACTION, [mid, player, other, total, points, points])))
-    save("tennis", ms, ps, xs, extra=TENNIS_EXTRA, provenance=dict(source="Jeff Sackmann / Tennis Abstract, retained archive by Aneeshers; ATP 2023–2024", url="https://github.com/Aneeshers/tennis-sackmann-archive", license="CC BY-NC-SA 4.0 — noncommercial use; derived CSVs same license", limitations=["Only completed best-of-three ATP men's singles; no Grand Slam best-of-five or retirements.", "Source dates are tournament starts. date is conservative result availability (start +14 days); pre_match_date is tournament start. All same-tournament and overlapping unpublished results excluded from features.", "Aces only where reported; missing aces omitted, never imputed as zero.", "Point threat: fraction of total match points won, derived from both players' serve points and serve points won. No shot-level context.", "ground is the tournament name; surface, level, round and pre-tournament rankings are recorded per match and are blank where the source has none."]))
+    years = sorted({m["pre_match_date"][:4] for m in ms})
+    provenance = dict(
+        source=f"Jeff Sackmann / Tennis Abstract, retained archive by Aneeshers; ATP {years[0]}–{years[-1]}",
+        url="https://github.com/Aneeshers/tennis-sackmann-archive",
+        license="CC BY-NC-SA 4.0 — noncommercial use",
+        limitations=[
+            "Only completed best-of-three ATP men's singles; no Grand Slam best-of-five or retirements.",
+            "Archive rows use tournament start for pre_match_date and start +14 days for result availability. Supplement rows use the published match day for both. Features use only results available before the prediction day.",
+            "Aces only where reported; missing aces omitted, never imputed as zero.",
+            "Point threat: fraction of total match points won, derived from both players' serve points and serve points won. No shot-level context.",
+            "Ground is the tournament name. Surface, level and round are included when published. Entry rankings and points are available on archive rows.",
+        ],
+    )
+    if supplemental_matches:
+        provenance["source"] += " + local supplemental match results"
+        provenance["license"] += ". Supplemental data follows its sources' noncommercial terms."
+        provenance["supplement"] = {"matches": supplemental_matches, "manifest": f"{LOCAL_RESULTS}/snapshot.json"}
+    save("tennis", ms, ps, xs, extra=TENNIS_EXTRA, provenance=provenance)
 
 
 def baseball():

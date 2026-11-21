@@ -28,3 +28,34 @@ and sport filters. No decorative animation or external runtime assets.
 Preserve model/source attribution and unavailable states. Never invent
 confidence intervals, forecasts, or accuracy claims. UI checks use cached
 fixture data; they do not validate prediction accuracy.
+
+## World tab (#world)
+
+Markets, AI briefing, model releases, AI news and sports headlines, in that
+order. Reuses the Butter hero, `.panel`, `.chip`, `.tag` and `.note` patterns and
+semantic tokens only; no hex colours. Price direction is shown with an arrow
+and a +/- sign as well as colour, and the sparkline is an inline SVG with an
+`aria-label` giving its start and end values. Filter chips are pressed-state
+buttons with 44px targets that keep focus after filtering. Each panel has its
+own loading, error (with Try again) and stale states. External links open in a
+new tab with a visually hidden notice. Model dates are catalogue listing dates
+("Newly listed"), never claimed as release dates. The AI briefing must cite
+supplied items and states that AI can be wrong; it uses free OpenRouter models
+only and is metered. See docs/superpowers/specs/2026-11-21-world-pulse-design.md.
+
+Selects use `.select-wrap` (native control, token-drawn chevron) so keyboard,
+touch and themes all work. Race pickers group Completed and Upcoming races.
+
+## Motion & Micro-Animation Architecture
+
+MatchLab implements a physically grounded, mathematically calibrated motion system designed around human perceptual thresholds:
+- **Kinematic Easing Curves**:
+  - `--ease-spring: cubic-bezier(0.34, 1.32, 0.64, 1)`: Damped harmonic spring ($\zeta \approx 0.82$, $\omega_n \approx 28\text{ rad/s}$) for tactile pop on chips, badges, and toggles.
+  - `--ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1)`: High-velocity exponential decay touchdown for card elevation, view transitions, and probability bars.
+  - `--ease-press: cubic-bezier(0.2, 0.8, 0.2, 1)`: Instantaneous mechanical actuation for button/card `:active` depressions.
+- **Micro-Interactions**:
+  - **Cards & Showcases**: Staggered waterfall cascade (`--motion-stagger-step: 28ms`, capped at 336ms), tactile lift ($\Delta y = -3.5\text{px}$), sub-pixel elevation shadows, thumbnail micro-scale ($1.08\times$), and diagonal arrow translation.
+  - **Live Telemetry & Radar Ping**: Concentric double-harmonic ripple wave on `.tag.live` and `.live-pulse-dot` providing real-time match status without layout thrashing.
+  - **Probability Meters & Forecasts**: Fluid width expansion via `--ease-out-expo` with specular algorithmic gradient sweep (`@keyframes bar-sweep`), accompanied by smooth numeric counter roll-ups.
+  - **Financial Terminal & Charts**: SVG path stroke-dash progressive trace (`@keyframes chart-stroke-draw`) and area mountain fade-in.
+  - **Strict Accessibility**: Zero motion latency override under `@media (prefers-reduced-motion: reduce)` guaranteeing safety for motion-sensitive users.

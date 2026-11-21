@@ -333,7 +333,13 @@ let gridRaceId=null, gridEdited=false;
 function selectedRace(){return sportMeta().races.find(r=>r.race_id===$("#race-round").value);}
 function raceOptions(season, raceId){
  const races=sportMeta().races.filter(r=>String(r.season)===season);
- $("#race-round").innerHTML=races.map(r=>`<option value="${e(r.race_id)}">${r.round}. ${e(r.name)}</option>`).join("");
+ // Group by date, not the dataset's "completed" flag, which lags until results are imported.
+ const today=new Date().toISOString().slice(0,10);
+ const label=r=>`${r.round}. ${r.name} · ${new Date(`${r.date}T12:00:00Z`).toLocaleDateString([],{day:"numeric",month:"short",timeZone:"UTC"})}`;
+ const option=r=>`<option value="${e(r.race_id)}">${e(label(r))}</option>`;
+ const group=(name,rows)=>rows.length?`<optgroup label="${name}">${rows.map(option).join("")}</optgroup>`:"";
+ const past=races.filter(r=>r.date<today), ahead=races.filter(r=>r.date>=today);
+ $("#race-round").innerHTML=past.length&&ahead.length?group("Completed",past)+group("Upcoming",ahead):races.map(option).join("");
  if(races.some(r=>r.race_id===raceId))$("#race-round").value=raceId;
 }
 function selectRace(race){

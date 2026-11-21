@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#fdfbe4">
 <title>MatchLab</title>
 <link rel="icon" href="/favicon.svg">
+<link rel="preload" href="/outfit.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/astryx.css">
 <link rel="stylesheet" href="/dash.css">
 </head>
@@ -15,13 +16,15 @@
   <a class="brand" href="#matches"><span class="brand-symbol" aria-hidden="true">M<span>↗</span></span>MatchLab<span class="brand-period">.</span></a>
   <nav aria-label="Sections">
     <a href="#matches" data-tab="matches">Matches</a>
+    <a href="#world" data-tab="world">World</a>
     <a href="#f1" data-tab="f1">Formula 1</a>
     <a href="#record" data-tab="record">Track record</a>
     <a href="#settings" data-tab="settings">Settings</a>
   </nav>
 </header>
-<div class="utility-bar"><span>SPORTS INTELLIGENCE <span class="utility-divider">/</span> Your matchday companion</span><div class="budgets" id="budgets" aria-label="Request budgets"></div></div>
-<main id="view" tabindex="-1" aria-live="polite"><p class="note">Loading your matchday…</p></main>
+<div class="utility-bar"><span>SPORTS INTELLIGENCE <span class="utility-divider" aria-hidden="true">/</span> Your matchday companion</span><div class="budgets" id="budgets" aria-label="Request budgets"></div></div>
+<main id="view" tabindex="-1"><p class="note">Loading your matchday…</p></main>
+<div id="status" class="vh" role="status" aria-live="polite" aria-atomic="true"></div>
 <footer class="foot">Forecasts are probabilities from a statistical model, not certainties. Fixture and live data: ESPN and CricketData.org. Ball-by-ball history: Cricsheet. Tennis results: Jeff Sackmann / Tennis Abstract. <a href="/lab">Open the older lab view</a></footer>
 <script src="/dash.js"></script>
 </body>

@@ -32,7 +32,7 @@ To restart the managed background dashboard, run `Set-Location 'D:\Sports Predic
 | --- | --- | --- | --- | --- |
 | Football | 1,140 EPL 2021–2024 | Yes, including draws | Missing source data | Teams |
 | Cricket | 1,195 IPL T20 2008–2026 | Yes, completed binary result | Runs; batter-vs-bowler boundary fraction | Teams / players |
-| Tennis | 4,847 ATP best-of-three 2023–2024 | Yes, sets, no draws | Aces; total match points won fraction | Competitors / players |
+| Tennis | 14,965 ATP best-of-three, 2020 to 18 Nov 2026 | Yes, sets, no draws | Aces; total match points won fraction | Competitors / players |
 | Badminton | 3,723 men's singles matches, 2018–2022 | Trained logistic outcomes and ridge scores | Points and rally-win fraction from the selected ShuttleSet annotations | Competitors / players with 8+ results |
 | Baseball | 2,424 MLB 2023 | Yes, runs, no draws | Missing source data | Teams |
 | Rugby | 625 Super Rugby union 2011–2015 | Yes, points, including draws | Missing source data | Teams |
@@ -78,7 +78,7 @@ In Cricket, open **Toss and starting XIs** to enter the toss winner and decision
 - **Cricket win chance** blends the ball-by-ball simulation with a team rating built from past results (`matchlab/cricket_ratings.py`). On held-out matches the winner pick rose from 60% to 65% (T20, 500 matches), 65% to 74% (T20 internationals, 300) and 53% to 57% (one-day, 273). Refit the blend with `python tools/backtest_cricket_sim.py --rescore artifacts/cricket-sim-backtest-t20.json`.
 - **Live cricket** now reads the scorecard: the batters at the crease and the overs each bowler has used go into the projection.
 - **AI checks** (`matchlab/ai_check.py`): at each stage of a match a free OpenRouter model reads the model's numbers and the live score and may move the win chance by at most 5 points, with reasons. One request per stage, at most 12 per match, metered by the budget ledger, saved in `data/local/predictions.json` and graded on the Track record page. The page works without it.
-- **Tennis** (`matchlab/tennis_forecast.py`): surface-aware Elo ratings from ATP and WTA results since 2020 plus a point-by-point set model, so the win chance follows the live set score. Held-out winner pick: 65% ATP, 67% WTA. Refresh the results with `python tools/fetch_tennis_archive.py` (the archive is updated upstream irregularly), then `python tools/backtest_tennis.py`.
+- **Tennis** (`matchlab/tennis_forecast.py`) uses surface-aware Elo from ATP and WTA results since 2020 and a point-by-point set model. The local 19 November 2026 snapshot includes ATP Challenger results through 19 November and WTA 125 results through 18 November. The ATP main-tour results used in the best-of-three dataset run through 18 November. See [data sources and coverage](DATA_SOURCES.md#tennis-match-dashboard). Run `python tools/fetch_tennis_archive.py` to refresh the base archive, `python tools/import_public_data.py tennis` to rebuild the best-of-three dataset, and `python tools/backtest_tennis.py` to rerun the Elo backtest.
 
 ## Formula 1
 
@@ -95,7 +95,7 @@ The model fits retirement and finishing order locally and simulates 10,000 races
 
 Features include previous scoring/conceding means, win/draw rates, history counts, head-to-head statistics, recorded venue and days since the previous available result. Player contexts add score mean/variation, appearances, previous scores against the selected side and action/conceded-rate histories. Winner-coded source columns, current match scores/results and numeric identity encodings are never inputs. Exact inputs, raw outputs, targets, context counts/dates/hashes and original model checksums are expandable in the dashboard.
 
-Each historical example uses information strictly before **its own** pre-match date. Query contexts contain only results available before the selected cutoff. Same-day results are excluded. Tennis dates are tournament starts: results conservatively become available at start +14 days; historical features use tournament start, excluding same-tournament and overlapping unpublished results.
+Each historical example uses information strictly before **its own** pre-match date. Query contexts contain only results available before the selected cutoff. Same-day results are excluded. The tennis best-of-three dataset uses tournament start plus 14 days as result availability for archive rows and the published match day for supplemental rows.
 
 CPU defaults: at most 192 recent eligible rows per task, minimum 24, two ensemble members, four PyTorch threads. A side/player needs two previous observations. Official `fit()` prepares labels, preprocessing and context; pretrained weights are never optimized. Official NaN handling represents absent head-to-head/versus statistics. Contexts are separate by sport/task; all sports share the same original weight files. Regression results are explicitly clipped to nonnegative scores, [0,1] fractions or [0,2] best-of-three set/game expectations; raw results and transformations remain visible.
 
@@ -108,7 +108,7 @@ CPU defaults: at most 192 recent eligible rows per task, minimum 24, two ensembl
 - `config.local.json`: active real config. `config.pretrained.example.json`: portable equivalent. `config.demo.json`: original synthetic workspace.
 - [docs/LEGACY_DASHBOARD.md](docs/LEGACY_DASHBOARD.md): preserved original documentation and generic ONNX/joblib/TorchScript/Keras/linear-JSON contracts; its old model-download status is superseded.
 
-Tennis data permits noncommercial use under CC BY-NC-SA 4.0. Cricsheet JSON uses ODC Attribution 1.0. Retrosheet credit is displayed in Data & models. Notices for CC0 rugby/football and MIT ShuttleSet annotations are retained; no videos were downloaded.
+The tennis archive uses CC BY-NC-SA 4.0, and the supplement follows its sources' noncommercial terms. Cricsheet JSON uses ODC Attribution 1.0. Retrosheet credit is displayed in Data & models. Notices for CC0 rugby/football and MIT ShuttleSet annotations are retained; no videos were downloaded.
 
 Setup is already completed. A fresh installation can create Python 3.12 with `uv venv --python 3.12 .venv`, install the pinned official libraries from `requirements-lock.txt` (CPU PyTorch uses its official wheel index), then explicitly run these **one-time online setup** commands:
 

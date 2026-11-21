@@ -21,7 +21,7 @@ from matchlab.cricket import validate_post_toss
 from matchlab.cricket_preview import build_context
 from matchlab.live import annotate
 from matchlab.openrouter_key import OpenRouterKey
-from matchlab import ai_check, budget, calibration, cricket_forecast, tennis_forecast, tracker
+from matchlab import ai_check, budget, calibration, cricket_forecast, tennis_forecast, tracker, world
 
 ROOT = Path(__file__).resolve().parent
 SUMMARY_INSTRUCTIONS = """You explain a cricket forecast to a fan in plain English.
@@ -68,6 +68,9 @@ class LocalServer(ThreadingHTTPServer):
         self.schedule_lock = threading.Lock()
         self.forecast_lock = threading.Lock()
         self.ai_lock = threading.Lock()
+        self.world_cache = world.Cache()
+        self.brief = world.BriefStore(ROOT / "data/local/cache/world_brief.json")
+        self.brief_lock = threading.Lock()
         self.summaries = {}
         # TCPServer calls server_close() if binding or activation fails.
         self.stop_forecasts = threading.Event()
@@ -411,17 +414,35 @@ class Handler(BaseHTTPRequestHandler):
             self.server.f1_timing_cache[key] = (time.monotonic() + ttl, data)
         return data
 
-    def _send(self, code, payload, mime="application/json; charset=utf-8"):
+    def _send(self, code, payload, mime="application/json; charset=utf-8", cache="no-store", etag=None):
         body = json.dumps(payload, allow_nan=False).encode() if not isinstance(payload, bytes) else payload
         self.send_response(code)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        if etag:
+            self.send_header("ETag", etag)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         self.end_headers()
-        self.wfile.write(body)
+        if code != 304:
+            self.wfile.write(body)
+
+    # How long a browser may keep each kind of file. API replies are never cached. Pages, scripts and styles are
+    # revalidated on every load (a 304 costs almost nothing); fonts and images change rarely.
+    STATIC_CACHE = {".html": "no-cache", ".js": "no-cache", ".css": "no-cache", ".svg": "no-cache",
+                    ".woff2": "public, max-age=604800, immutable", ".jpg": "public, max-age=86400",
+                    ".jpeg": "public, max-age=86400", ".png": "public, max-age=86400", ".webp": "public, max-age=86400"}
+
+    def _send_static(self, path, mime):
+        body = path.read_bytes()
+        info = path.stat()
+        etag = f'"{info.st_mtime_ns:x}-{len(body):x}"'
+        cache = self.STATIC_CACHE.get(path.suffix.lower(), "no-cache")
+        if self.headers.get("If-None-Match") == etag:
+            return self._send(304, b"", mime, cache, etag)
+        return self._send(200, body, mime, cache, etag)
 
     def do_GET(self):
         if not self._local_request():
@@ -433,6 +454,11 @@ class Handler(BaseHTTPRequestHandler):
                                         "features": FEATURES, "token": self.server.token, "offline": True,
                                         "demo_config": default_config(), "real_config": self.server.real_config,
                                         "openrouter_key_status": self.server.openrouter_key.status()})
+        if route == "/api/session":
+            # What the dashboard needs to start: the request token and whether a key is saved. /api/state also
+            # carries the full model catalogue (several MB) for the lab page and should not gate the first paint.
+            return self._send(200, {"token": self.server.token, "offline": True,
+                                    "openrouter_key_status": self.server.openrouter_key.status()})
         if route == "/api/health":
             return self._send(200, {"ok": True, "offline": True})
         if route == "/api/today-matches":
@@ -454,6 +480,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "Choose a season and round."})
             data = self._f1_timing(season, round_number)
             return self._send(200, data) if data is not None else self._send(503, {"error": "Lap timing is temporarily unavailable."})
+        if route == "/api/world":
+            query = parse_qs(urlsplit(self.path).query)
+            name = (query.get("section") or [""])[0]
+            if name not in world.TTL:
+                return self._send(400, {"error": "Choose markets, news, models or sports."})
+            return self._send(200, self._world_section(name, (query.get("refresh") or [""])[0] == "1"))
+        if route == "/api/world-brief":
+            return self._send(200, self._brief_state())
         if route == "/api/track-record":
             return self._send(200, self._track_record())
         files = {"/": ("dash.html", "text/html; charset=utf-8"), "/dash.js": ("dash.js", "text/javascript; charset=utf-8"),
@@ -465,10 +499,71 @@ class Handler(BaseHTTPRequestHandler):
                  "/fraunces.woff2": ("fraunces.woff2", "font/woff2"),
                  "/lab": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                  "/style.css": ("style.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml")}
+        if route.startswith("/images/"):
+            img_rel = route.lstrip("/")
+            img_target = (ROOT / "web" / img_rel).resolve()
+            web_dir = (ROOT / "web").resolve()
+            if img_target.is_file() and img_target.is_relative_to(web_dir):
+                ext = img_target.suffix.lower()
+                mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png" if ext == ".png" else "image/webp" if ext == ".webp" else "application/octet-stream"
+                return self._send_static(img_target, mime)
         if route not in files:
             return self._send(404, {"error": "Not found"})
         filename, mime = files[route]
-        return self._send(200, (ROOT / "web" / filename).read_bytes(), mime)
+        return self._send_static(ROOT / "web" / filename, mime)
+
+    def _world_section(self, name, refresh=False):
+        """One World Pulse section, from cache or a short-lived worker. A refresh is honoured at most every 30 seconds."""
+        def fetch(section):
+            done = subprocess.run([sys.executable, str(ROOT / "tools/fetch_world.py"), section],
+                                  capture_output=True, text=True, timeout=45, encoding="utf-8")
+            return json.loads(done.stdout)
+        cache = self.server.world_cache
+        age = cache.age(name)
+        return world.serve(name, fetch, cache, force=refresh and (age is None or age > 30))
+
+    def _brief_state(self):
+        store = self.server.brief
+        meter = budget.status(ROOT)["openrouter"]
+        return {"saved": store.load(), "age": store.age(), "ttl": world.BRIEF_TTL, "min_gap": world.BRIEF_MIN_GAP,
+                "has_key": self.server.openrouter_key.status() != "missing",
+                "budget": {key: meter[key] for key in ("used", "limit", "remaining", "reserve")}}
+
+    def _world_brief(self, payload):
+        """One free-model briefing from the headlines already on screen. Metered, saved, and never repeated within 3 hours."""
+        store = self.server.brief
+        age = store.age()
+        if age is not None and age < (world.BRIEF_MIN_GAP if payload.get("force") is True else world.BRIEF_TTL):
+            return {**self._brief_state(), "cached": True}
+        if self.server.openrouter_key.status() == "missing":
+            raise ValueError("Save an OpenRouter key in Settings to write the briefing.")
+        sections = {name: self.server.world_cache.get(name) for name in world.TTL}
+        context, ids = world.brief_context(sections)
+        if len(ids) < 4:
+            raise ValueError("The headlines are still loading. Try again in a moment.")
+        with self.server.openrouter_lock:
+            secret = self.server.openrouter_key.get()
+        if not self.server.brief_lock.acquire(blocking=False):
+            raise ValueError("A briefing is already being written.")
+        try:
+            if not budget.spend(ROOT, "openrouter", "World briefing"):
+                raise ValueError("Today's AI request budget is used up. It resets at midnight UTC.")
+            try:
+                done = subprocess.run([sys.executable, str(ROOT / "tools/fetch_openrouter_preview.py")],
+                                      input=json.dumps({"key": secret, "context": context, "instructions": world.BRIEF_INSTRUCTIONS, "json": True}),
+                                      encoding="utf-8", capture_output=True, timeout=55)
+                report = json.loads(done.stdout)
+            except (subprocess.SubprocessError, ValueError):
+                raise ValueError("The AI model took too long or sent an unreadable reply. Try again.") from None
+            if "error" in report:
+                raise ValueError(report["error"])
+            brief = world.parse_brief(report["text"], ids)
+            if brief is None:
+                raise ValueError("The AI model did not write a usable briefing. Try again.")
+            store.save(brief, report["model"], world.brief_links(sections))
+        finally:
+            self.server.brief_lock.release()
+        return {**self._brief_state(), "cached": False}
 
     def _race_grid(self, race):
         engine = self.server.engine.race_engine
@@ -580,6 +675,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self._today_payload(self.server.refresh_fixtures()))
             if route in ("/api/cricket-preview-context", "/api/cricket-preview"):
                 return self._cricket_preview(payload, route == "/api/cricket-preview")
+            if route == "/api/world-brief":
+                return self._send(200, self._world_brief(payload))
             if route == "/api/openrouter-key":
                 with self.server.openrouter_lock:
                     if payload.get("action") == "save":

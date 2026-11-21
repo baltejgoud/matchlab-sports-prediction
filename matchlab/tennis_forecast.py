@@ -16,6 +16,7 @@ from functools import lru_cache
 from .live import name_key
 
 FOLDER = "data/raw/tennis_tour"
+LOCAL_RESULTS = "data/local/tennis_results"
 ROUNDS = {"Q1": 0, "Q2": 1, "Q3": 2, "Q4": 2, "RR": 3, "R128": 3, "R64": 4, "R32": 5, "R16": 6, "QF": 7, "SF": 8, "BR": 9, "F": 10}
 SURFACE_WEIGHT = 0.35        # share of the surface rating in the blended rating (chosen by backtest)
 SERVE_AVERAGE = {"atp": 0.635, "wta": 0.565}      # points won on serve, tour-wide
@@ -50,6 +51,7 @@ class Ratings:
         self.tour, self.players, self.h2h, self.events = tour, {}, defaultdict(list), {}
         self.matches = self.last_day = 0
         self.by_name = {}
+        self.alias_ids = defaultdict(set)
 
     def expected(self, a, b, surface):
         return 1 / (1 + 10 ** ((b.rating(surface) - a.rating(surface)) / 400))
@@ -59,6 +61,8 @@ class Ratings:
         surface, day = row["surface"] or "Hard", row["day"]
         self.events[name_key(row["tourney_name"])] = (surface, row["tourney_name"], day)
         for player, side in ((winner, "winner"), (loser, "loser")):
+            if source_name := row.get(f"{side}_source_name"):
+                self.alias_ids[name_key(source_name)].add(row[f"{side}_id"])
             rank = _number(row.get(f"{side}_rank"))
             if rank:
                 player.rank, player.rank_day = int(rank), day
@@ -90,6 +94,9 @@ class Ratings:
         self.by_name = {}
         for pid, player in sorted(self.players.items(), key=lambda item: item[1].last_day or 0):
             self.by_name[name_key(player.name)] = pid
+        for alias, ids in self.alias_ids.items():
+            if len(ids) == 1:
+                self.by_name.setdefault(alias, next(iter(ids)))
 
     def find(self, name):
         key = name_key(name)
@@ -113,12 +120,17 @@ class Ratings:
         return near[len(near) // 2] if near else None
 
 
+def result_files(root, tour):
+    folders = (root / FOLDER / tour, root / LOCAL_RESULTS / tour)
+    return [path for folder in folders for path in sorted(folder.glob("*.csv"))]
+
+
 def read_rows(root, tour):
     rows = []
-    for path in sorted((root / FOLDER / tour).glob("*.csv")):
+    for path in result_files(root, tour):
         with path.open(encoding="utf-8", newline="") as file:
             for row in csv.DictReader(file):
-                stamp = row.get("tourney_date") or ""
+                stamp = row.get("match_date") or row.get("tourney_date") or ""
                 if len(stamp) != 8 or not stamp.isdecimal() or not row.get("winner_id") or not row.get("loser_id"):
                     continue
                 row["day"] = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:])).toordinal()
@@ -138,10 +150,10 @@ def _fitted(root, tour, stamp):
 
 
 def ratings(root, tour):
-    files = sorted((root / FOLDER / tour).glob("*.csv"))
+    files = result_files(root, tour)
     if not files:
         raise ValueError("Tennis results are not downloaded yet. Run: python tools/fetch_tennis_archive.py")
-    return _fitted(root, tour, tuple((f.name, f.stat().st_mtime_ns) for f in files))
+    return _fitted(root, tour, tuple((f, f.stat().st_mtime_ns) for f in files))
 
 
 # ---- point-by-point model ---------------------------------------------------------------

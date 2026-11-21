@@ -4,6 +4,9 @@ const view = document.getElementById("view");
 const state = { token: "", schedule: null, filter: "all", timer: null, request: 0, players: {}, keyStatus: null, refreshing: false, aiBusy: null, aiTried: {}, aiError: {} };
 const SPORTS = { cricket: "Cricket", tennis: "Tennis", f1: "Formula 1" };
 state.search = "";
+state.pickers = {};
+state.limit = {};
+const PAGE = 12;
 const THEMES = { butter: "Butter", neutral: "Neutral", chocolate: "Chocolate" };
 state.theme = "butter";
 try {
@@ -19,12 +22,18 @@ function changeTheme(theme) {
   try { localStorage.setItem("matchlab-astryx-theme", theme); } catch (_) { /* Keep this session's palette. */ }
 }
 
+// Listeners are remembered on the node so the keyed patch below can swap in the newest closure.
+function bind(node, type, fn) {
+  if (node._on && node._on[type]) node.removeEventListener(type, node._on[type]);
+  (node._on = node._on || {})[type] = fn;
+  node.addEventListener(type, fn);
+}
 function h(tag, attrs, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
     if (value === false || value == null) continue;
     if (key === "class") node.className = value;
-    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (key.startsWith("on")) bind(node, key.slice(2), value);
     else node.setAttribute(key, value === true ? "" : value);
   }
   for (const child of children.flat()) {
@@ -33,7 +42,124 @@ function h(tag, attrs, ...children) {
   }
   return node;
 }
-const show = (...nodes) => view.replaceChildren(...nodes.flat().filter((n) => n != null && n !== false));
+function animateNumber(node, target, suffix = "") {
+  if (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    node.textContent = target + suffix;
+    return;
+  }
+  const numeric = typeof target === "number" ? target : parseInt(target, 10);
+  if (isNaN(numeric)) {
+    node.textContent = target + suffix;
+    return;
+  }
+  const duration = 340;
+  const start = performance.now();
+  const initial = 0;
+  function step(now) {
+    const elapsed = now - start;
+    const progress = Math.min(1, elapsed / duration);
+    const ease = 1 - Math.pow(1 - progress, 3);
+    const current = Math.round(initial + (numeric - initial) * ease);
+    node.textContent = current + suffix;
+    if (progress < 1) requestAnimationFrame(step);
+    else node.textContent = target + suffix;
+  }
+  requestAnimationFrame(step);
+}
+// One polite live region for the whole app. Only deliberate messages go through it (a new view, a score that
+// changed, an error), never the content of a refresh, so a screen reader is not read the page every 12 seconds.
+const statusRegion = document.getElementById("status");
+let announceTimer = 0;
+function announce(message) {
+  if (!statusRegion || !message) return;
+  clearTimeout(announceTimer);
+  statusRegion.textContent = "";
+  announceTimer = setTimeout(() => { statusRegion.textContent = message; }, 60);
+}
+const show = (...nodes) => {
+  view.classList.remove("view-enter");
+  void view.offsetWidth;
+  view.replaceChildren(...nodes.flat().filter((n) => n != null && n !== false));
+  view.dataset.route = state.routeKey || "";
+  view.classList.add("view-enter");
+  // First reveal only: counters count up once per view. Later updates change the number in place.
+  view.querySelectorAll("[data-countup]").forEach((node) => animateNumber(node, Number(node.dataset.countup)));
+  if (state.focusHeading) {
+    state.focusHeading = false;
+    const heading = view.querySelector("h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+      announce(heading.textContent.replace(/\s+/g, " ").trim());
+    }
+  }
+};
+// ---- keyed patch -----------------------------------------------------------------------
+// Same-route updates (a poll, a filter, a search) patch the existing DOM instead of rebuilding it, so focus,
+// scroll, open <details>, typed text and selects survive, entrance animations do not replay, and a value that
+// changed is updated in place with one brief highlight. A node with data-k is matched by key; a node with
+// data-atomic is kept whole while its key is unchanged and replaced when it changes (use it for components whose
+// listeners close over their own child nodes).
+const FLASH = "[data-live], .num, .stat .v, .teams b, .probabilities strong";
+function flash(el) { el.classList.remove("changed"); void el.offsetWidth; el.classList.add("changed"); }
+function morphAttrs(o, n) {
+  const details = o.tagName === "DETAILS";
+  for (const a of [...o.attributes]) if (!n.hasAttribute(a.name) && !(details && a.name === "open")) o.removeAttribute(a.name);
+  for (const a of n.attributes) if (!(details && a.name === "open") && o.getAttribute(a.name) !== a.value) o.setAttribute(a.name, a.value);
+  for (const type of Object.keys(o._on || {})) if (!(n._on && n._on[type])) { o.removeEventListener(type, o._on[type]); delete o._on[type]; }
+  for (const [type, fn] of Object.entries(n._on || {})) bind(o, type, fn);
+}
+function sameKind(o, n) {
+  if (o.nodeType !== n.nodeType) return false;
+  if (o.nodeType !== 1) return true;
+  return o.tagName === n.tagName && o.namespaceURI === n.namespaceURI && !n.hasAttribute("data-atomic") && !o.hasAttribute("data-atomic");
+}
+function morphNode(o, n) {
+  if (o.nodeType !== 1) {
+    if (o.data !== n.data) {
+      const host = o.parentElement, had = o.data.trim() !== "";
+      o.data = n.data;
+      const target = host && host.closest(FLASH);
+      if (had && target && !host.closest("[aria-busy]")) flash(target);
+    }
+    return;
+  }
+  morphAttrs(o, n);
+  if (o.tagName === "SELECT") {
+    const values = (select) => [...select.options].map((option) => option.value).join("\u0000");
+    if (values(o) !== values(n)) o.replaceWith(n);
+    return;
+  }
+  if (o.tagName === "INPUT" || o.tagName === "TEXTAREA") return;
+  morphChildren(o, n);
+}
+function morphChildren(o, n) {
+  const kids = [...n.childNodes], byKey = new Map();
+  // Drop keyed nodes that are gone first, so the survivors keep their order and are never moved: moving a node
+  // restarts its CSS animation.
+  const wanted = new Set(kids.filter((k) => k.nodeType === 1 && k.hasAttribute("data-k")).map((k) => k.getAttribute("data-k")));
+  for (const child of [...o.childNodes]) if (child.nodeType === 1 && child.hasAttribute("data-k") && !wanted.has(child.getAttribute("data-k"))) child.remove();
+  for (const child of o.childNodes) if (child.nodeType === 1 && child.hasAttribute("data-k")) byKey.set(child.getAttribute("data-k"), child);
+  kids.forEach((next, i) => {
+    const cur = o.childNodes[i] || null;
+    const key = next.nodeType === 1 ? next.getAttribute("data-k") : null;
+    if (key != null) {
+      const found = byKey.get(key);
+      if (found && found.tagName === next.tagName) {
+        if (found !== cur) o.insertBefore(found, cur);
+        if (!next.hasAttribute("data-atomic")) morphNode(found, next);
+      } else o.insertBefore(next, cur);
+    } else if (cur && !(cur.nodeType === 1 && cur.hasAttribute("data-k")) && sameKind(cur, next)) morphNode(cur, next);
+    else o.insertBefore(next, cur);
+  });
+  while (o.childNodes.length > kids.length) o.lastChild.remove();
+}
+function showMorph(...nodes) {
+  if (view.dataset.route !== (state.routeKey || "")) return show(...nodes);
+  const next = document.createDocumentFragment();
+  next.append(...nodes.flat().filter((n) => n != null && n !== false));
+  morphChildren(view, next);
+}
 const pct = (p) => `${Math.round(p * 100)}%`;
 const time = (iso) => iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
 const day = (iso) => iso ? new Date(iso).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }) : "";
@@ -77,22 +203,52 @@ function modelled(match) {
   return /t20|twenty20|t10|odi|list a|one-day|one day/.test(`${kind} ${(match.tournament || "").toLowerCase()}`);
 }
 
-function card(match) {
+function card(match, index = 0) {
   const live = match.state === "in";
   const ready = modelled(match);
   const tagText = live ? "Live" : match.state === "post" ? "Finished" : time(match.start);
   const badge = match.sport === "f1" ? h("span", { class: "tag ok" }, "Explore F1")
     : ready ? h("span", { class: "tag ok" }, "Forecast ready")
       : h("span", { class: "tag off" }, match.sport === "tennis" ? "Players not decided" : "Not modelled yet");
-  return h("button", { class: `card match-card${live ? " is-live" : ""}`, type: "button", onclick: () => { location.hash = `match/${encodeURIComponent(match.id)}`; } },
-    h("div", { class: "meta" }, h("span", {}, `${SPORTS[match.sport]}${match.detail ? " · " + match.detail : ""}`),
-      h("span", { class: `tag${live ? " live" : ""}` }, tagText)),
+  return h("button", {
+    class: `card match-card${live ? " is-live" : ""}`,
+    "data-k": match.id,
+    style: `--stagger:${Math.min(index, 12)};`,
+    type: "button",
+    onclick: () => { location.hash = `match/${encodeURIComponent(match.id)}`; }
+  },
+    h("div", { class: "match-card-top" },
+      h("div", { class: "meta" }, h("span", {}, `${SPORTS[match.sport]}${match.detail ? " · " + match.detail : ""}`),
+        h("span", { class: `tag${live ? " live" : ""}` }, tagText))),
     h("div", { class: "teams" },
       h("span", {}, h("span", { class: "team-name" }, match.team), h("b", {}, match.team_score || "")),
       match.opponent ? h("span", {}, h("span", { class: "team-name" }, match.opponent), h("b", {}, match.opponent_score || "")) : null),
     h("div", { class: "tour" }, [match.tournament, match.venue].filter(Boolean).join(" · ")),
     h("div", { class: "foot2" }, h("span", {}, live || match.state === "post" ? (match.status || "") : `${day(match.start)} · ${countdown(match.start)}`), badge),
     h("div", { class: "card-action" }, "Explore match", h("span", { "aria-hidden": "true" }, "↗")));
+}
+
+// How old the data is, in words, with a level the page can style. Thresholds are minutes.
+function freshness(iso, limits = [20, 60]) {
+  const minutes = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  if (!Number.isFinite(minutes)) return { level: "unknown", text: "Check time unknown" };
+  const age = minutes < 2 ? "just now" : minutes < 60 ? `${minutes} min ago` : `${Math.floor(minutes / 60)} h ${minutes % 60} min ago`;
+  if (minutes <= limits[0]) return { level: "fresh", text: `Checked ${age}` };
+  if (minutes <= limits[1]) return { level: "stale", text: `Checked ${age}. Scores may be a little behind.` };
+  return { level: "old", text: `Checked ${age}. Scores may be out of date: press Refresh.` };
+}
+function freshnessChip(iso) {
+  const info = freshness(iso);
+  return h("span", { class: `freshness ${info.level}`, "data-freshness": iso }, info.text);
+}
+// Ages are re-worded in place every 30 seconds, so a page left open never claims old data is fresh.
+function updateFreshness() {
+  document.querySelectorAll("[data-freshness]").forEach((node) => {
+    const info = freshness(node.dataset.freshness);
+    if (node.textContent !== info.text) node.textContent = info.text;
+    const next = `freshness ${info.level}`;
+    if (node.className !== next) node.className = next;
+  });
 }
 
 function renderMatches() {
@@ -105,29 +261,39 @@ function renderMatches() {
   const live = by("in"), soon = by("pre"), done = by("post");
   const filters = h("div", { class: "row", role: "group", "aria-label": "Sport" },
     ["all", ...Object.keys(SPORTS)].map((key) => h("button", { class: "chip", type: "button", "aria-pressed": String(state.filter === key),
-      onclick: () => { state.filter = key; renderMatches(); } }, key === "all" ? "All sports" : SPORTS[key])));
+      onclick: () => { state.filter = key; state.limit = {}; renderMatches(); } }, key === "all" ? "All sports" : SPORTS[key])));
   const refresh = h("button", { class: "btn", type: "button", disabled: state.refreshing, onclick: refreshSchedule },
     state.refreshing ? "Checking..." : "Refresh");
-  const section = (title, rows, empty) => h("section", { class: "section" },
+  // Long lists are capped at 12 cards with a "show more" button, so the schedule stays scannable and the DOM small.
+  const cards = (key, rows) => {
+    const shown = state.limit[key] || PAGE, left = rows.length - shown;
+    return [h("div", { class: "cards" }, rows.slice(0, shown).map((m, i) => card(m, i))),
+      left > 0 ? h("button", { class: "btn world-more", type: "button", onclick: () => { state.limit[key] = shown + PAGE; renderMatches(); } }, `Show ${Math.min(PAGE, left)} more (${left} left)`) : null];
+  };
+  const section = (key, title, rows, empty) => h("section", { class: "section", "data-k": key },
     h("h2", {}, title, h("span", { class: "count" }, rows.length ? `${rows.length}` : "")),
-    rows.length ? h("div", { class: "cards" }, rows.map(card)) : h("p", { class: "note" }, empty));
+    rows.length ? cards(key, rows) : h("p", { class: "note" }, empty));
   const search = h("input", { type: "search", class: "match-search", value: state.search, placeholder: "Search teams, leagues or venues", "aria-label": "Search teams, leagues or venues",
-    oninput: (event) => { const position = event.target.selectionStart; state.search = event.target.value; renderMatches(); const field = view.querySelector(".match-search"); field.focus(); if (position != null) field.setSelectionRange(position, position); } });
-  show(
-    h("section", { class: "matchday-hero", "aria-label": "Matchday overview" },
+    oninput: (event) => { state.search = event.target.value; state.limit = {}; clearTimeout(state.searchTimer); state.searchTimer = setTimeout(renderMatches, 150); } });
+  const heroStatsNodes = [["Live now", "in"], ["Coming up", "pre"], ["Finished", "post"]].map(([label, status]) => {
+    const val = data ? all.filter((m) => m.state === status).length : null;
+    const numNode = h("strong", { class: "num", "data-countup": val }, val != null ? String(val) : "—");
+    return h("div", {}, h("span", {}, label), numNode);
+  });
+  showMorph(
+    h("section", { class: "matchday-hero", "aria-label": "Matchday overview", "data-k": "hero" },
       h("div", { class: "hero-copy" }, h("p", { class: "eyebrow" }, "THE MATCHDAY EDIT"), h("h1", {}, "Every match.", h("br"), h("span", {}, "A clearer picture.")),
         h("p", {}, "Your daily view of live scores, upcoming fixtures and the numbers behind the game."),
         h("span", { class: "hero-date" }, new Date().toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }))),
-      h("div", { class: "hero-stats" }, [["Live now", "in"], ["Coming up", "pre"], ["Finished", "post"]].map(([label, status]) =>
-        h("div", {}, h("span", {}, label), h("strong", { class: "num" }, data ? all.filter((m) => m.state === status).length : "—"))))),
+      h("div", { class: "hero-stats" }, heroStatsNodes)),
     h("div", { class: "head matches-heading" }, h("div", {}, h("p", { class: "eyebrow" }, "YOUR MATCH CENTRE"), h("h2", {}, "On the schedule"),
-      h("p", { class: "sub" }, data && data.last_updated ? `Last checked ${time(data.last_updated)} · Open a match to explore its forecast.` : "Loading fixtures…")), refresh),
+      h("p", { class: "sub" }, data && data.last_updated ? [freshnessChip(data.last_updated), " Open a match to explore its forecast."] : "Loading fixtures…")), refresh),
     h("div", { class: "filter-bar" }, filters, search),
     data && data.refresh_error ? h("p", { class: "note error" }, data.refresh_error) : null,
     data && (data.sources || []).filter((s) => s.error).map((s) => h("p", { class: "note warn" }, `${s.name}: ${s.error}`)),
-    section("Live now", live, state.search ? "No live matches match your search. Try another team or league." : "A quiet moment. No matches are in play for this sport right now."),
-    section("Coming up", soon, state.search ? "No upcoming matches match your search." : "No upcoming fixtures for this selection in the next day."),
-    done.length ? h("details", { class: "section more" }, h("summary", {}, `Finished today (${done.length})`), h("div", { class: "cards", style: "margin-top:10px" }, done.map(card))) : null);
+    section("live", "Live now", live, state.search ? "No live matches match your search. Try another team or league." : "A quiet moment. No matches are in play for this sport right now."),
+    section("soon", "Coming up", soon, state.search ? "No upcoming matches match your search." : "No upcoming fixtures for this selection in the next day."),
+    done.length ? h("details", { class: "section more", "data-k": "done" }, h("summary", {}, `Finished today (${done.length})`), h("div", { style: "margin-top:10px" }, cards("done", done))) : null);
 }
 
 async function refreshSchedule() {
@@ -138,7 +304,7 @@ async function refreshSchedule() {
     state.schedule = await api("/api/refresh-today-matches", {});
     showBudgets(state.schedule.budget);
   } catch (error) {
-    if (state.schedule) state.schedule.refresh_error = error.message;
+    if (state.schedule) state.schedule.refresh_error = `${String(error.message).replace(/[.\s]*$/, ".")} Showing the last saved schedule. Try Refresh again in a moment.`;
   }
   state.refreshing = false;
   if (!location.hash || location.hash === "#matches") renderMatches();
@@ -166,14 +332,13 @@ function playerPicker(rows, key, display) {
   if (!rows.length) return h("p", { class: "sub" }, "Named player projections are waiting for a usable lineup.");
   const names = rows.map((row) => row.name);
   const selected = names.includes(state.players[key]) ? state.players[key] : names[0];
-  const metrics = h("div", { class: "player-forecast" });
-  const choose = (name) => {
-    state.players[key] = name;
-    metrics.replaceChildren(...display(rows[names.indexOf(name)]));
-  };
-  const select = h("select", { onchange: (event) => choose(event.target.value) },
-    names.map((name) => h("option", { value: name, selected: name === selected }, name)));
-  choose(selected);
+  const metrics = h("div", { class: "player-forecast" }, display(rows[names.indexOf(selected)]));
+  state.pickers[key] = { rows, names, display };      // read at event time, so the newest data is used after a patch
+  const select = h("select", { onchange: (event) => {
+    const picker = state.pickers[key];
+    state.players[key] = event.target.value;
+    event.target.closest(".players").querySelector(".player-forecast").replaceChildren(...picker.display(picker.rows[picker.names.indexOf(event.target.value)]));
+  } }, names.map((name) => h("option", { value: name, selected: name === selected }, name)));
   return h("div", { class: "players", "data-key": key }, h("label", { class: "player-select" }, h("span", {}, "Player"), select), metrics);
 }
 
@@ -219,12 +384,13 @@ function matchScoreboard(board) {
 function winOutlook(teams, win, reasons) {
   const favourite = win[0] >= win[1] ? 0 : 1;
   const even = pct(win[0]) === pct(win[1]);
+  const bar = h("div", { class: "probability-bar", "aria-hidden": "true" }, h("div", { style: `width:${(win[0] * 100).toFixed(1)}%` }));
   return h("div", { class: "outlook" },
     h("div", { class: "outlook-head" }, h("h3", {}, even ? "Too close to call" : `${teams[favourite].name} favoured to win`),
       h("span", { class: "tag" }, "Model forecast")),
     h("div", { class: "probabilities" }, teams.map((team, i) => h("div", {},
       h("strong", { class: "num" }, pct(win[i])), h("span", {}, team.name)))),
-    h("div", { class: "probability-bar", "aria-hidden": "true" }, h("div", { style: `width:${win[0] * 100}%` })),
+    bar,
     reasons.length ? h("ul", { class: "why" }, reasons.map((reason) => h("li", {}, reason))) : null);
 }
 
@@ -404,11 +570,13 @@ function aiPanel(f, id, sport) {
 
 function winPanel(f, title) {
   const [a, b] = f.teams, win = f.live ? [a.win, b.win] : nowWin(f);
+  const barA = h("div", { class: "a", style: `width:${(win[0] * 100).toFixed(1)}%` });
+  const barB = h("div", { class: "b", style: `width:${(win[1] * 100).toFixed(1)}%` });
   return h("section", { class: "panel" },
     h("h2", {}, title),
     h("div", { class: "winbar", role: "img", "aria-label": `${a.name} ${pct(win[0])}, ${b.name} ${100 - Math.round(win[0] * 100)}%` },
-      h("div", { class: "a", style: `width:${Math.max(8, win[0] * 100)}%` }, pct(win[0])), h("div", { class: "b", style: `width:${Math.max(8, win[1] * 100)}%` }, `${100 - Math.round(win[0] * 100)}%`)),
-    h("div", { class: "winlabels" }, h("span", {}, a.name), h("span", {}, b.name)),
+      barA, barB),
+    h("div", { class: "winlabels" }, h("span", { class: "num" }, `${a.name} ${pct(win[0])}`), h("span", { class: "num" }, `${b.name} ${100 - Math.round(win[0] * 100)}%`)),
     !f.live && f.ai && f.ai.check && f.ai.check.shift ? h("p", { class: "sub" }, `Model alone: ${a.name} ${pct(f.ai.model_win[0])}. The AI check moved it ${f.ai.check.shift > 0 ? "+" : ""}${f.ai.check.shift} points.`) : null,
     a.win_model != null ? h("p", { class: "sub" }, `Corrected from past results: the model alone said ${a.name} ${pct(a.win_model)}. Across ${f.calibration.graded} graded forecasts its favourites were given ${pct(f.calibration.favourite_expected)} on average and won ${pct(f.calibration.favourite_won)}, so its chances are ${f.calibration.factor < 1 ? "pulled toward" : "pushed away from"} 50%.`) : null,
     a.win_parts ? h("p", { class: "sub" }, `What goes into the model's number: player-by-player simulation ${pct(a.win_parts.simulation)} for ${a.name}, team results rating ${pct(a.win_parts.rating)}.`) : null);
@@ -416,8 +584,13 @@ function winPanel(f, title) {
 
 // ---- tennis match page ----------------------------------------------------------------
 function setRows(rows) {
-  return rows.map((row) => h("div", { class: "setrow" }, h("span", {}, `${row.winner} ${row.score.split("-").sort().reverse().join("-")}`),
-    h("div", { class: "track" }, h("div", { class: "fill", style: `width:${Math.round(row.chance * 100)}%` })), h("span", { class: "num" }, pct(row.chance))));
+  return rows.map((row) => {
+    const fill = h("div", { class: "fill", style: `width:${Math.round(row.chance * 100)}%` });
+    return h("div", { class: "setrow" },
+      h("span", {}, `${row.winner} ${row.score.split("-").sort().reverse().join("-")}`),
+      h("div", { class: "track" }, fill),
+      h("span", { class: "num" }, pct(row.chance)));
+  });
 }
 
 function tennisPlayer(t) {
@@ -452,13 +625,13 @@ function tennisLive(f) {
 
 function renderTennis(f, id) {
   const [a, b] = f.teams, fx = f.fixture, bt = f.analysis.backtest;
-  show(
+  showMorph(
     h("a", { class: "back", href: "#matches" }, "← All matches"),
     h("div", { class: "head" },
       h("div", {}, h("h1", {}, `${a.name} v ${b.name}`),
         h("p", { class: "sub" }, [fx.tournament, fx.detail, f.format, `${f.surface.name} court`, `${day(fx.start)} ${time(fx.start)}`, f.intel.state === "pre" ? countdown(fx.start) : f.intel.status].filter(Boolean).join(" · "))),
       h("button", { id: "refresh-match", class: "btn primary", type: "button", onclick: () => openMatch(id, true, true) }, "Refresh now")),
-    h("p", { id: "match-refresh-error", class: "note", role: "status", hidden: true }),
+    h("p", { id: "match-refresh-error", class: "note", hidden: true }),
     f.intel.available ? null : h("p", { class: "note warn" }, "The live score feed could not be read just now, so this is the pre-match forecast."),
     f.result ? resultPanel(f.result) : null,
     f.live ? tennisLive(f) : null,
@@ -484,17 +657,19 @@ function renderForecast(f, id) {
   const fx = f.fixture;
   const supported = f.supported;
   const start = fx.start ? `${day(fx.start)} · ${time(fx.start)}` : "";
-  show(
+  const preMatchPart = supported ? preMatchPanel(f, id) : h("section", { class: "panel" }, h("h2", {}, "Forecast unavailable"), h("p", { class: "sub" }, f.reason));
+  const livePart = supported ? livePanel(f, id) : h("section", { class: "panel" }, h("h2", {}, "Live analysis"), h("p", { class: "sub" }, f.reason));
+  showMorph(
     h("a", { class: "back", href: "#matches" }, "← All matches"),
     h("div", { class: "head" },
       h("div", {}, h("h1", {}, `${fx.team} vs ${fx.opponent}`),
         h("p", { class: "sub" }, [fx.tournament, supported ? `${f.category}’s ${f.format}` : fx.detail,
           fx.venue, start].filter(Boolean).join(" · "))),
       h("button", { id: "refresh-match", class: "btn primary", type: "button", onclick: () => openMatch(id, true, true) }, "Refresh now")),
-    h("p", { id: "match-refresh-error", class: "note warn", role: "status", hidden: true }),
+    h("p", { id: "match-refresh-error", class: "note warn", hidden: true }),
     matchScoreboard(f.scoreboard),
-    supported ? preMatchPanel(f, id) : h("section", { class: "panel" }, h("h2", {}, "Forecast unavailable"), h("p", { class: "sub" }, f.reason)),
-    supported ? livePanel(f, id) : h("section", { class: "panel" }, h("h2", {}, "Live analysis"), h("p", { class: "sub" }, f.reason)),
+    // While a match is in play the live win chance is what the reader came for, so it comes first.
+    ...(f.scoreboard.state === "in" ? [livePart, preMatchPart] : [preMatchPart, livePart]),
     f.result && f.result.saved_before_start ? resultPanel(f.result) : null,
     supported && f.ai ? aiPanel(f, id, "cricket") : null,
     supported ? analysisPanel(f) : null);
@@ -544,8 +719,13 @@ async function openMatch(id, manual, forceRefresh = false) {
     const statusMessage = document.getElementById("match-refresh-error");
     if (statusMessage) {
       statusMessage.hidden = false;
-      statusMessage.className = forecast.refresh_error ? "note warn" : "note";
-      statusMessage.textContent = forecast.refresh_error || `Updated at ${new Date().toLocaleTimeString()}. Scores and predictions may stay the same until the feed reports a change.`;
+      const feedAt = forecast.scoreboard?.checked_at;
+      const live = (forecast.intel?.state || forecast.scoreboard?.state) === "in";
+      const feedAge = feedAt ? Math.round((Date.now() - Date.parse(feedAt)) / 60000) : null;
+      const behind = live && feedAge != null && feedAge > 5;
+      statusMessage.className = forecast.refresh_error || behind ? "note warn" : "note";
+      statusMessage.textContent = forecast.refresh_error ? `${forecast.refresh_error} It retries by itself every minute, or press Refresh now.`
+        : `Updated at ${new Date().toLocaleTimeString()}.${feedAge != null ? ` Live feed last checked ${feedAge < 2 ? "just now" : feedAge + " min ago"}${behind ? ", so the score may be behind" : ""}.` : ""} Scores and predictions stay the same until the feed reports a change.`;
     }
     if (forecast.ai && forecast.ai.due && sport === "tennis" && !state.aiBusy && !state.aiTried[aiKey(id, forecast)]) askAi(id, sport, forecast);
     if (manual || state.autoRefreshed) {
@@ -557,6 +737,12 @@ async function openMatch(id, manual, forceRefresh = false) {
       }
       window.scrollTo(0, scroll);
     }
+    const board = forecast.scoreboard;
+    const scoreLine = sport === "tennis" ? (forecast.live ? `Score ${forecast.live.score}` : "")
+      : board ? board.teams.map((team) => `${team.name} ${team.score || ""}`.trim()).join(", ") : "";
+    state.lastScore = state.lastScore || {};
+    if (scoreLine && state.lastScore[id] && state.lastScore[id] !== scoreLine) announce(`Score update. ${scoreLine}`);
+    state.lastScore[id] = scoreLine;
     const startsIn = Date.parse(forecast.fixture.start) - Date.now();
     const status = forecast.intel?.state || forecast.scoreboard?.state;
     state.liveMatch = status === "in" ? id : null;
@@ -578,6 +764,7 @@ async function openMatch(id, manual, forceRefresh = false) {
       refreshError.hidden = false;
       refreshError.className = "note warn";
       refreshError.textContent = `Could not refresh the match. Showing the last available update. ${error.message}`;
+      announce(refreshError.textContent);
       state.timer = setTimeout(() => { if (isCurrent()) openMatch(id, true); }, 60000);
       return;
     }
@@ -600,19 +787,27 @@ async function renderRecord() {
     const { summary, sports } = await api("/api/track-record");
     if (request !== state.request) return;
     const rate = (record) => record.n ? `${record.correct} of ${record.n}` : "—";
+    // Wilson 95% interval: with a handful of graded forecasts the honest answer is a wide range, not one number.
+    const spread = (record) => {
+      if (!record.n) return "none graded yet";
+      const z = 1.96, p = record.correct / record.n, d = 1 + z * z / record.n, c = p + z * z / (2 * record.n);
+      const m = z * Math.sqrt(p * (1 - p) / record.n + z * z / (4 * record.n * record.n));
+      return `${pct(record.correct / record.n)} · 95% range ${pct(Math.max(0, (c - m) / d))} to ${pct(Math.min(1, (c + m) / d))} · n = ${record.n}`;
+    };
+    const counted = (summary) => summary.graded + summary.waiting;
     const detail = h("section", { id: "sport-record", "aria-labelledby": "sport-record-title" });
     const filters = h("div", { class: "row record-filters", role: "group", "aria-label": "Sport" });
     function select(sport) {
       const { summary: stats, matches } = sports[sport];
       for (const button of filters.children) button.setAttribute("aria-pressed", String(button.value === sport));
       const calibration = summary.calibration[sport];
-      const metrics = [stat("Winner picked", rate(stats.winner), `${stats.graded} graded · ${stats.waiting} waiting`)];
-      if (sport !== "f1") metrics.push(stat("Winner with AI check", rate(stats.ai_winner)));
-      if (sport === "tennis") metrics.push(stat("Exact set score", rate(stats.set_score)));
+      const metrics = [stat("Winner picked", rate(stats.winner), `${spread(stats.winner)} · ${stats.waiting} waiting`)];
+      if (sport !== "f1") metrics.push(stat("Winner with AI check", rate(stats.ai_winner), spread(stats.ai_winner)));
+      if (sport === "tennis") metrics.push(stat("Exact set score", rate(stats.set_score), spread(stats.set_score)));
       if (sport === "cricket") metrics.push(
         stat("First-innings error", stats.first_innings.mean_error == null ? "—" : `${stats.first_innings.mean_error} runs`,
-          `${stats.first_innings.in_range} of ${stats.first_innings.n} inside the range`),
-        stat("Top batter", rate(stats.top_batter)), stat("Top wicket-taker", rate(stats.top_bowler)));
+          `n = ${stats.first_innings.n} · ${stats.first_innings.in_range} inside the range`),
+        stat("Top batter", rate(stats.top_batter), spread(stats.top_batter)), stat("Top wicket-taker", rate(stats.top_bowler), spread(stats.top_bowler)));
       const table = h("div", { class: "scroll" }, h("table", {},
         h("thead", {}, h("tr", {}, ["Event", "Forecast", "Saved", "Result"].map((label) => h("th", { scope: "col" }, label)))),
         h("tbody", {}, matches.map((match) => {
@@ -625,7 +820,7 @@ async function renderRecord() {
               : `#match/${encodeURIComponent(match.id)}` }, title), h("div", { class: "sub" }, day(match.fixture.start))),
             h("td", {}, `${favourite.name} ${pct(favourite.win)}`),
             h("td", {}, time(match.saved_at), stage ? h("div", { class: "sub" }, stage) : null,
-              match.saved_before_start ? null : h("div", { class: "sub" }, "Opened after start")),
+              match.saved_before_start ? null : h("div", { class: "sub" }, "Opened after start · not counted")),
             h("td", {}, !result ? "Waiting for result" : !result.winner_pick ? (result.status || "No winner") :
               h("span", { class: result.winner_pick.correct ? "good" : "bad" }, `${result.winner} won · ${result.winner_pick.correct ? "Correct" : "Missed"}`),
               result?.first_innings ? h("div", { class: "sub" }, `First innings ${result.first_innings.actual} vs forecast ${result.first_innings.predicted}`) : null,
@@ -634,9 +829,10 @@ async function renderRecord() {
       detail.replaceChildren(
         h("h2", { id: "sport-record-title" }, SPORTS[sport]),
         h("div", { class: "stats record-stats" }, metrics),
+        h("p", { class: "sub" }, `${counted(stats)} forecasts counted (saved before the start), ${stats.graded} graded. ${stats.saved - counted(stats)} more were opened after the start and are not counted.`),
         calibration ? h("p", { class: "sub" }, calibration.graded < calibration.needed
-          ? `Win chance calibration needs ${calibration.needed} graded forecasts. ${calibration.graded} available.`
-          : `Favourites won ${pct(calibration.favourite_won)} of ${calibration.graded} graded forecasts. Average predicted chance was ${pct(calibration.favourite_expected)}.`) : null,
+          ? `Not calibrated yet: that needs ${calibration.needed} graded forecasts and ${calibration.graded} are available, so the win chances shown are the model's own.`
+          : `Favourites won ${pct(calibration.favourite_won)} of ${calibration.graded} graded forecasts (n = ${calibration.graded}). Their average predicted chance was ${pct(calibration.favourite_expected)}.`) : null,
         h("section", { class: "panel" }, h("h3", {}, "Saved forecasts"),
           matches.length ? table : h("p", { class: "note" }, sport === "f1"
             ? "Run a Formula 1 forecast before the race to start tracking it."
@@ -645,11 +841,20 @@ async function renderRecord() {
     }
     for (const [sport, label] of Object.entries(SPORTS)) {
       filters.append(h("button", { class: "chip", type: "button", value: sport, "aria-controls": "sport-record",
-        onclick: () => { state.recordSport = sport; select(sport); } }, `${label} · ${sports[sport].summary.saved}`));
+        onclick: () => { state.recordSport = sport; select(sport); } }, `${label} · ${counted(sports[sport].summary)} counted`));
     }
-    show(h("div", { class: "head" }, h("div", {}, h("h1", {}, "Track record"),
-      h("p", { class: "sub" }, "Accuracy counts forecasts saved before play or the race start."))),
-      filters, detail);
+    const totals = Object.values(sports).reduce((acc, s) => ({ counted: acc.counted + counted(s.summary), graded: acc.graded + s.summary.graded, after: acc.after + (s.summary.saved - counted(s.summary)) }), { counted: 0, graded: 0, after: 0 });
+    const recordHero = h("section", { class: "record-hero", "aria-label": "Track record overview" },
+      h("div", { class: "record-hero-copy" },
+        h("p", { class: "eyebrow" }, "TRACK RECORD"),
+        h("h1", {}, "What the model said,", h("br"), h("span", {}, "and how it did.")),
+        h("p", {}, "A forecast counts only if it was saved before the event began. Results are graded from final scores, and every rate shows how many forecasts it rests on."),
+        h("span", { class: "hero-date" }, "Forecasts opened after the start are listed, never counted.")),
+      h("div", { class: "record-hero-stat" },
+        h("span", {}, "Forecasts counted"),
+        h("strong", { class: "num" }, `${totals.counted}`),
+        h("p", { class: "sub" }, `${totals.graded} graded so far · ${totals.after} opened after the start and excluded`)));
+    show(recordHero, filters, detail);
     select(state.recordSport || "cricket");
   } catch (error) {
     if (request === state.request) show(h("h1", {}, "Track record"), h("p", { class: "note error", role: "alert" }, error.message));
@@ -687,8 +892,10 @@ function renderSettings() {
         h("button", { class: "btn", type: "button", onclick: () => send("clear") }, "Remove key")), message));
 }
 
-function f1LapPanel(last, next, request) {
-  const choices = [last, next].filter((race) => race?.season && race?.round);
+function f1LapPanel(season, last, next, request) {
+  const byRound = new Map();
+  for (const race of [...season, last, next]) if (race?.season && race?.round) byRound.set(`${race.season}/${race.round}`, race);
+  const choices = [...byRound.values()].sort((a, b) => a.date.localeCompare(b.date));
   const panel = h("section", { class: "panel", "aria-labelledby": "f1-lap-title" },
     h("h2", { id: "f1-lap-title" }, "Lap-by-lap analysis"));
   if (!choices.length) {
@@ -698,9 +905,14 @@ function f1LapPanel(last, next, request) {
   const key = (race) => `${race.season}/${race.round}`;
   const start = (race) => Date.parse(`${race.date}T${race.time || "00:00:00Z"}`);
   const preferred = next && start(next) <= Date.now() ? next : last || next;
-  const select = h("select", { id: "f1-lap-race" },
-    choices.map((race) => h("option", { value: key(race), selected: key(race) === key(preferred) }, race.raceName)));
-  const status = h("p", { class: "note", role: "status" });
+  // Every race of the season, split into what has been run (newest first) and what is still to come.
+  const started = choices.filter((race) => start(race) <= Date.now()).reverse();
+  const upcoming = choices.filter((race) => start(race) > Date.now());
+  const label = (race) => `Round ${race.round} · ${race.raceName} · ${new Date(`${race.date}T12:00:00Z`).toLocaleDateString([], { day: "numeric", month: "short", timeZone: "UTC" })}`;
+  const group = (title, races) => races.length ? h("optgroup", { label: title }, races.map((race) => h("option", { value: key(race) }, label(race)))) : null;
+  const select = h("select", { id: "f1-lap-race" }, group(`Completed or under way (${started.length})`, started), group(`Upcoming (${upcoming.length})`, upcoming));
+  select.value = key(preferred);
+  const status = h("p", { class: "note" });
   const rows = h("div", { class: "scroll lap-table", tabindex: "0", role: "region", "aria-label": "Lap timing" });
   const refresh = h("button", { class: "btn", type: "button", onclick: load }, "Refresh laps");
   let captured = new Map(), generation = 0;
@@ -755,7 +967,7 @@ function f1LapPanel(last, next, request) {
     rows.replaceChildren();
     load();
   });
-  panel.append(h("div", { class: "row lap-controls" }, h("label", { for: "f1-lap-race" }, "Grand Prix"), select, refresh), status, rows);
+  panel.append(h("div", { class: "row lap-controls" }, h("label", { for: "f1-lap-race" }, "Grand Prix"), h("span", { class: "select-wrap" }, select), refresh), status, rows);
   load();
   return panel;
 }
@@ -779,9 +991,15 @@ async function renderF1() {
       h("p", {}, "Standings, results and the road ahead."),
       h("div", { class: "f1-hero-bottom" }, h("span", {}, `Jolpica checked ${new Date(data.checked_at).toLocaleString()} · Data may be delayed`), h("button", { class: "btn", type: "button", onclick: renderF1 }, "Refresh data"))),
       h("div", { class: "f1-overview" },
-        h("section", { class: "panel" }, h("p", { class: "f1-label" }, "NEXT RACE"), next ? [h("h2", {}, next.raceName), h("p", { class: "sub" }, `${next.Circuit?.circuitName || ""} · ${day(next.date + "T" + (next.time || "00:00:00Z"))}`), h("p", {}, next.time ? time(next.date + "T" + next.time) : "Start time to be confirmed")] : data.next ? h("p", {}, "No upcoming race published.") : unavailable()),
-        h("section", { class: "panel" }, h("p", { class: "f1-label" }, "CHAMPIONSHIP LEADER"), drivers.length ? [h("h2", {}, `${drivers[0].Driver.givenName} ${drivers[0].Driver.familyName}`), h("p", { class: "sub" }, (drivers[0].Constructors || []).map(x => x.name).join(" / ")), h("p", { class: "f1-points" }, `${drivers[0].points} pts`)] : unavailable())),
-      f1LapPanel(last, next, request),
+        h("section", { class: "panel f1-feature-card" },
+          h("div", { class: "f1-card-body" },
+            h("p", { class: "f1-label" }, "NEXT RACE"),
+            next ? [h("h2", {}, next.raceName), h("p", { class: "sub" }, `${next.Circuit?.circuitName || ""} · ${day(next.date + "T" + (next.time || "00:00:00Z"))}`), h("p", {}, next.time ? time(next.date + "T" + next.time) : "Start time to be confirmed")] : data.next ? h("p", {}, "No upcoming race published.") : unavailable())),
+        h("section", { class: "panel f1-feature-card" },
+          h("div", { class: "f1-card-body" },
+            h("p", { class: "f1-label" }, "CHAMPIONSHIP LEADER"),
+            drivers.length ? [h("h2", {}, `${drivers[0].Driver.givenName} ${drivers[0].Driver.familyName}`), h("p", { class: "sub" }, (drivers[0].Constructors || []).map(x => x.name).join(" / ")), h("p", { class: "f1-points" }, `${drivers[0].points} pts`)] : unavailable()))),
+      f1LapPanel(data.schedule?.RaceTable?.Races || [], last, next, request),
       h("div", { class: "f1-grid" },
         h("section", { class: "panel" }, h("p", { class: "f1-label" }, `${driversList?.season || "CURRENT"} SEASON · ROUND ${driversList?.round || "—"}`), h("h2", {}, "Driver standings"), drivers.length ? table(["Pos", "Driver", "Team", "Wins", "Points"], drivers.map(d => h("tr", {}, h("td", {}, d.position), h("td", {}, `${d.Driver.givenName} ${d.Driver.familyName}`), h("td", {}, (d.Constructors || []).map(c => c.name).join(" / ")), h("td", {}, d.wins), h("td", {}, h("strong", {}, d.points))))) : unavailable()),
         h("section", { class: "panel" }, h("p", { class: "f1-label" }, "THE TEAMS"), h("h2", {}, "Constructor standings"), teams.length ? table(["Pos", "Team", "Wins", "Points"], teams.map(t => h("tr", {}, h("td", {}, t.position), h("td", {}, t.Constructor.name), h("td", {}, t.wins), h("td", {}, h("strong", {}, t.points))))) : unavailable())),
@@ -793,6 +1011,369 @@ async function renderF1() {
   }
 }
 
+// ---- World: markets, AI news, model releases and sports headlines -------------------------------
+const MAJOR_LABS = new Set(["anthropic", "openai", "google", "meta", "mistral", "mistralai", "xai", "x-ai", "deepseek", "qwen", "alibaba", "microsoft", "nvidia", "amazon", "cohere", "perplexity", "moonshotai", "z-ai", "meta-llama"]);
+const SPORT_LABELS = { cricket: "Cricket", football: "Football", tennis: "Tennis", f1: "Formula 1" };
+const WORLD_SECTIONS = ["markets", "news", "models", "sports"];
+const WORLD_STEP = { news: 10, models: 8, sports: 12 };
+state.world = { data: {}, filters: { news: "all", models: "all", sports: "all" }, shown: { ...WORLD_STEP }, brief: null, briefBusy: false, briefError: "", briefTried: false, selectedStock: "ANT" };
+
+const ago = (iso) => {
+  const mins = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  if (!Number.isFinite(mins)) return "";
+  if (mins < 2) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  if (mins < 48 * 60) return `${Math.round(mins / 60)} h ago`;
+  return `${Math.round(mins / 1440)} d ago`;
+};
+const money = (n, currency = "USD") => new Intl.NumberFormat([], { style: "currency", currency }).format(n);
+const compact = (n) => new Intl.NumberFormat([], { notation: "compact", maximumFractionDigits: 1 }).format(n);
+const signed = (n, digits = 2) => `${n > 0 ? "+" : n < 0 ? "−" : ""}${Math.abs(n).toFixed(digits)}`;
+const external = (href, text, cls) => h("a", { class: cls, href, target: "_blank", rel: "noopener noreferrer" }, text, h("span", { class: "vh" }, " (opens in a new tab)"));
+
+// Markets use only what the quote feed supplies: price, change against the start of the 5-day window,
+// the day and 52-week ranges, volume and the 30-minute closes. Nothing is estimated or simulated.
+const SVG_NS = "http://www.w3.org/2000/svg";
+let sparkId = 0;
+function svgEl(tag, attrs, ...children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) if (value != null && value !== false) node.setAttribute(key, String(value));
+  for (const child of children.flat()) if (child) node.append(child);
+  return node;
+}
+
+function smoothBezierPath(pts) {
+  if (!pts || pts.length < 2) return "";
+  let d = `M ${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(i - 1, 0)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(i + 2, pts.length - 1)];
+    const cp1x = (p1[0] + (p2[0] - p0[0]) / 6).toFixed(1);
+    const cp1y = (p1[1] + (p2[1] - p0[1]) / 6).toFixed(1);
+    const cp2x = (p2[0] - (p3[0] - p1[0]) / 6).toFixed(1);
+    const cp2y = (p2[1] - (p3[1] - p1[1]) / 6).toFixed(1);
+    d += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+  }
+  return d;
+}
+
+function brokerSparkline(series, direction, width = 140, height = 36) {
+  if (!Array.isArray(series) || series.length < 2) return null;
+  const low = Math.min(...series), high = Math.max(...series), span = high - low || 1;
+  const padY = 3;
+  const pts = series.map((v, i) => [(i / (series.length - 1)) * width, height - padY - ((v - low) / span) * (height - 2 * padY)]);
+  const curveD = smoothBezierPath(pts);
+  const gradId = `spark-grad-${++sparkId}`;
+  return svgEl("svg", { viewBox: `0 0 ${width} ${height}`, class: `mini-broker-spark ${direction}`, preserveAspectRatio: "none", "aria-hidden": "true", focusable: "false" },
+    svgEl("defs", {}, svgEl("linearGradient", { id: gradId, x1: 0, y1: 0, x2: 0, y2: 1 },
+      svgEl("stop", { offset: "0%", "stop-color": "currentColor", "stop-opacity": 0.32 }),
+      svgEl("stop", { offset: "100%", "stop-color": "currentColor", "stop-opacity": 0 }))),
+    svgEl("path", { d: `${curveD} L ${width},${height} L 0,${height} Z`, fill: `url(#${gradId})` }),
+    svgEl("path", { d: curveD, fill: "none", stroke: "currentColor", "stroke-width": 2, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+}
+
+// A range card is drawn only when the feed supplied both ends of the range.
+function rangeMetricCard(label, current, low, high, currency) {
+  if (low == null || high == null || high <= low) return null;
+  const share = Math.max(0, Math.min(100, ((current - low) / (high - low)) * 100));
+  return h("div", { class: "range-metric-card" },
+    h("div", { class: "range-title-row" }, h("span", { class: "range-label" }, label), h("span", { class: "range-current tnum" }, `${share.toFixed(0)}% of the way up`)),
+    h("div", { class: "range-track", "aria-hidden": "true" }, h("div", { class: "range-fill" }), h("div", { class: "range-pin", style: `--pin:${share.toFixed(1)}` })),
+    h("div", { class: "range-extremes" }, h("span", { class: "tnum" }, `Low ${money(low, currency)}`), h("span", { class: "tnum" }, `High ${money(high, currency)}`)));
+}
+
+function tickerStrip(quotes, activeSymbol, onSelect) {
+  return h("div", { class: "ticker-marquee-wrap", role: "group", "aria-label": "Tickers" },
+    h("div", { class: "ticker-marquee-track" }, quotes.map((q) => {
+      const known = typeof q.change_pct === "number";
+      return h("button", { class: `ticker-marquee-item${q.symbol === activeSymbol ? " active" : ""}`, type: "button", "aria-pressed": String(q.symbol === activeSymbol), onclick: () => onSelect(q.symbol) },
+        h("span", { class: "item-sym" }, q.symbol), h("span", { class: "item-price tnum" }, money(q.price, q.currency)),
+        known ? h("span", { class: `item-pill tnum ${q.change_pct >= 0 ? "good" : "bad"}` }, `${q.change_pct >= 0 ? "▲" : "▼"} ${signed(q.change_pct)}%`) : null);
+    })));
+}
+
+function priceChart(q, series, direction, onScrub, onLeave) {
+  const svgW = 860, svgH = 220, padL = 16, padR = 84, padT = 18, padB = 18;
+  const chartW = svgW - padL - padR, chartH = svgH - padT - padB;
+  const low = Math.min(...series), high = Math.max(...series), span = high - low || 1;
+  const pts = series.map((v, i) => [padL + (i / (series.length - 1)) * chartW, padT + (1 - (v - low) / span) * chartH]);
+  const curveD = smoothBezierPath(pts);
+  const gradId = `terminal-grad-${++sparkId}`;
+  const tone = direction === "good" ? "var(--color-text-success)" : direction === "bad" ? "var(--color-text-error)" : "var(--color-accent)";
+  const grid = [[high, padT], [low + span / 2, padT + chartH / 2], [low, padT + chartH]].flatMap(([value, y]) => [
+    svgEl("line", { x1: padL, y1: y, x2: padL + chartW, y2: y, class: "chart-gridline" }),
+    svgEl("text", { x: padL + chartW + 8, y: y + 3, class: "chart-gridlabel tnum" }, money(value, q.currency))]);
+  const cursor = svgEl("g", { class: "chart-cursor", hidden: "" },
+    svgEl("line", { class: "scrubber-line-v", y1: padT, y2: padT + chartH }), svgEl("circle", { class: "scrubber-dot", r: 5 }));
+  const svg = svgEl("svg", { viewBox: `0 0 ${svgW} ${svgH}`, class: "broker-chart-svg", preserveAspectRatio: "none", role: "img",
+    "aria-label": `${q.symbol} closing prices over the last 5 sessions: from ${money(series[0], q.currency)} to ${money(series[series.length - 1], q.currency)}, low ${money(low, q.currency)}, high ${money(high, q.currency)}` },
+    svgEl("defs", {}, svgEl("linearGradient", { id: gradId, x1: 0, y1: 0, x2: 0, y2: 1 },
+      svgEl("stop", { offset: "0%", "stop-color": tone, "stop-opacity": 0.3 }), svgEl("stop", { offset: "100%", "stop-color": tone, "stop-opacity": 0 }))),
+    grid,
+    svgEl("path", { d: `${curveD} L ${pts[pts.length - 1][0].toFixed(1)},${padT + chartH} L ${pts[0][0].toFixed(1)},${padT + chartH} Z`, fill: `url(#${gradId})`, class: "broker-chart-area" }),
+    svgEl("path", { d: curveD, fill: "none", class: `broker-chart-path ${direction}` }),
+    cursor);
+  const wrap = h("div", { class: "broker-chart-wrap" }, svg);
+  wrap.addEventListener("pointermove", (event) => {
+    const box = svg.getBoundingClientRect();
+    if (!box.width) return;
+    const ratio = Math.max(0, Math.min(1, ((event.clientX - box.left) * (svgW / box.width) - padL) / chartW));
+    const index = Math.round(ratio * (series.length - 1));
+    const [x, y] = pts[index];
+    cursor.removeAttribute("hidden");
+    cursor.firstChild.setAttribute("x1", x.toFixed(1)); cursor.firstChild.setAttribute("x2", x.toFixed(1));
+    cursor.lastChild.setAttribute("cx", x.toFixed(1)); cursor.lastChild.setAttribute("cy", y.toFixed(1));
+    onScrub(series[index]);
+  });
+  wrap.addEventListener("pointerleave", () => { cursor.setAttribute("hidden", ""); onLeave(); });
+  return wrap;
+}
+
+function brokerTerminal(q) {
+  const known = typeof q.change_pct === "number";
+  const direction = !known ? "flat" : q.change_pct >= 0 ? "good" : "bad";
+  const series = Array.isArray(q.series) && q.series.length >= 2 ? q.series : null;
+  const quoteTime = q.as_of ? `Quote as of ${new Date(q.as_of).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}` : "Quote time not supplied";
+  const price = h("div", { class: "terminal-price tnum" }, money(q.price, q.currency));
+  const changeLine = (delta, pctChange, context) => [h("span", { "aria-hidden": "true" }, delta >= 0 ? "▲ " : "▼ "), `${signed(delta)} (${signed(pctChange)}%)`, h("span", { class: "change-context" }, context)];
+  const change = known ? h("div", { class: `terminal-change-pill tnum ${direction}` }, changeLine(q.change, q.change_pct, "since 5 sessions ago")) : null;
+  const note = h("div", { class: "terminal-subtext" }, quoteTime);
+  const chart = series ? priceChart(q, series, direction, (value) => {
+    price.textContent = money(value, q.currency);
+    const delta = value - series[0];
+    if (change) { change.className = `terminal-change-pill tnum ${delta >= 0 ? "good" : "bad"}`; change.replaceChildren(...changeLine(delta, series[0] > 0 ? (delta / series[0]) * 100 : 0, "vs first close shown")); }
+    note.textContent = "Reading the chart: 30-minute closes";
+  }, () => {
+    price.textContent = money(q.price, q.currency);
+    if (change) { change.className = `terminal-change-pill tnum ${direction}`; change.replaceChildren(...changeLine(q.change, q.change_pct, "since 5 sessions ago")); }
+    note.textContent = quoteTime;
+  }) : h("p", { class: "note" }, "No price history was supplied for this ticker.");
+  const tile = (label, value) => h("div", { class: "stat-tile" }, h("span", { class: "stat-tile-k" }, label), h("span", { class: "stat-tile-v tnum" }, value));
+  return h("article", { class: "broker-terminal primary", "aria-label": `${q.name}, ${q.symbol}`, "data-atomic": "",
+    "data-k": [q.symbol, q.price, q.as_of, series ? series.length : 0].join("|") },
+    h("div", { class: "terminal-topbar" }, h("div", { class: "terminal-ticker-info" },
+      h("span", { class: "terminal-symbol" }, q.symbol), h("span", { class: "terminal-name" }, q.name), q.exchange ? h("span", { class: "terminal-exchange" }, q.exchange) : null)),
+    h("div", { class: "terminal-hero-row" }, h("div", { class: "terminal-price-stack" }, price, change), note),
+    chart,
+    h("div", { class: "terminal-metrics-deck" },
+      rangeMetricCard("Day range", q.price, q.day_low, q.day_high, q.currency),
+      rangeMetricCard("52-week range", q.price, q.year_low, q.year_high, q.currency)),
+    h("div", { class: "terminal-stats-grid" },
+      tile("Volume", q.volume != null ? compact(q.volume) : "—"),
+      tile("Day high / low", q.day_high != null && q.day_low != null ? `${money(q.day_high, q.currency)} / ${money(q.day_low, q.currency)}` : "—"),
+      tile("Close 5 sessions ago", known && q.change != null ? money(q.price - q.change, q.currency) : "—"),
+      tile("Currency", q.currency || "—")));
+}
+
+function watchlistCard(q, isActive, onSelect) {
+  const known = typeof q.change_pct === "number";
+  const direction = !known ? "flat" : q.change_pct >= 0 ? "good" : "bad";
+  const low = q.day_low ?? Math.min(...(q.series || [q.price]));
+  const high = q.day_high ?? Math.max(...(q.series || [q.price]));
+  const pinPct = Math.max(0, Math.min(100, ((q.price - low) / ((high - low) || 1)) * 100));
+  return h("button", {
+    class: `watchlist-item${isActive ? " active" : ""}`, type: "button", "aria-pressed": String(isActive),
+    "aria-label": `${q.symbol}, ${q.name}, ${money(q.price, q.currency)}${known ? `, ${q.change_pct >= 0 ? "up" : "down"} ${Math.abs(q.change_pct).toFixed(2)} percent over 5 sessions` : ""}`,
+    onclick: () => onSelect(q.symbol) },
+    h("div", { class: "watchlist-topline" }, h("div", {}, h("span", { class: "watchlist-symbol" }, q.symbol), h("span", { class: "watchlist-name" }, q.label || q.name)),
+      isActive ? h("span", { class: "watchlist-active-badge" }, "Shown") : null),
+    h("div", { class: "watchlist-price-row" }, h("span", { class: "watchlist-price tnum" }, money(q.price, q.currency)),
+      known ? h("span", { class: `watchlist-pill tnum ${direction}` }, `${q.change_pct >= 0 ? "▲ " : "▼ "}${signed(q.change_pct)}%`) : null),
+    h("div", { class: "watchlist-chart-row" }, brokerSparkline(q.series, direction, 140, 36)),
+    h("div", { class: "range-track", "aria-hidden": "true", style: "margin: 2px 0 0;" }, h("div", { class: "range-fill" }), h("div", { class: "range-pin", style: `--pin:${pinPct.toFixed(1)}` })));
+}
+
+function chipRow(label, options, current, pick) {
+  return h("div", { class: "row world-chips", role: "group", "aria-label": label },
+    options.map(([value, text, count]) => h("button", { class: "chip", type: "button", "data-chip": value, "aria-pressed": String(value === current), onclick: () => pick(value) },
+      text, count != null ? h("span", { class: "tab-count" }, count) : null)));
+}
+
+// replaceChildren would print the word "null" for an empty slot, so empty slots are dropped first.
+const put = (element, ...nodes) => {
+  const next = document.createDocumentFragment();
+  next.append(...nodes.flat().filter((n) => n != null && n !== false));
+  morphChildren(element, next);
+};
+function renderWorld() {
+  const request = ++state.request;
+  clearTimeout(state.timer);
+  const world = state.world, alive = () => request === state.request;
+  const parts = {};
+  const panel = (id, kicker, title) => {
+    const meta = h("p", { class: "world-meta" }), body = h("div", { class: "world-body", "aria-busy": "true" }, h("p", { class: "note", role: "status" }, "Loading…"));
+    const node = h("section", { class: "panel world-panel", "aria-labelledby": `world-${id}` },
+      h("div", { class: "world-head" }, h("div", {}, h("p", { class: "world-kicker" }, kicker), h("h2", { id: `world-${id}` }, title)), meta), body);
+    parts[id] = { node, meta, body };
+  };
+  const done = (id, data) => {
+    const part = parts[id], sources = data?.sources || [];
+    part.body.removeAttribute("aria-busy");
+    part.meta.textContent = data?.ok ? [`Checked ${time(data.checked_at)}`, data.stale ? "showing earlier data" : "",
+      sources.length ? `${sources.filter((s) => s.ok).length} of ${sources.length} sources` : ""].filter(Boolean).join(" · ") : "";
+    return part;
+  };
+  const failure = (id, label, data) => {
+    put(done(id, null).body, h("p", { class: "note error", role: "alert" }, `${label} could not be loaded. ${data?.error || "Check your connection and try again."}`),
+      h("button", { class: "btn", type: "button", onclick: () => load(id, true) }, "Try again"));
+  };
+  const keepFocus = (part, chip) => part.body.querySelector(`[data-chip="${CSS.escape(chip)}"]`)?.focus();
+  const more = (id, total, repaint) => world.shown[id] < total ? h("button", { class: "btn world-more", type: "button", onclick: () => {
+    const before = world.shown[id]; world.shown[id] += WORLD_STEP[id]; repaint();
+    parts[id].body.querySelectorAll(".feed > li")[before]?.querySelector("a")?.focus();
+  } }, `Show more (${total - world.shown[id]} left)`) : null;
+
+  const hero = h("div", { class: "world-hero" },
+    h("div", {}, h("p", { class: "eyebrow" }, "MATCHLAB / WORLD"), h("h1", {}, "What’s happening, ", h("span", {}, "your way.")),
+      h("p", {}, "Anthropic’s stock, AI news and new models, plus cricket, football, tennis and Formula 1. Everything links to its source."),
+      h("p", { class: "hero-date" }, new Date().toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" }))),
+    h("button", { class: "btn primary", type: "button", onclick: () => { WORLD_SECTIONS.forEach((id) => load(id, true)); } }, "Refresh everything"));
+
+  panel("markets", "MARKETS", "Anthropic and the AI trade");
+  panel("brief", "AI BRIEFING", "What matters today");
+  panel("models", "MODEL RELEASES", "New models");
+  panel("news", "AI NEWS", "Latest AI news");
+  panel("sports", "SPORTS", "Headlines from your sports");
+
+  function drawMarkets() {
+    const data = world.data.markets;
+    if (!data?.ok) return failure("markets", "Stock prices", data);
+    const quotes = data.quotes || [];
+    if (!world.selectedStock || !quotes.some((q) => q.symbol === world.selectedStock)) {
+      world.selectedStock = quotes.find((q) => q.symbol === "ANT")?.symbol || quotes[0]?.symbol || "ANT";
+    }
+    const activeQuote = quotes.find((q) => q.symbol === world.selectedStock) || quotes[0];
+    const select = (symbol) => { world.selectedStock = symbol; drawMarkets(); };
+    put(done("markets", data).body,
+      quotes.length ? tickerStrip(quotes, activeQuote?.symbol, select) : null,
+      h("div", { class: "market-row" },
+        activeQuote ? brokerTerminal(activeQuote) : h("p", { class: "note warn" }, "Stock quotes are unavailable right now."),
+        h("div", { class: "market-watchlist" },
+          h("div", { class: "watchlist-header" },
+            h("div", {}, h("h3", { class: "watchlist-title" }, "Watchlist"), h("p", { class: "watchlist-sub" }, "Choose a ticker to show its chart")),
+            h("span", { class: "tag ok" }, `${quotes.length} tickers`)),
+          h("div", { class: "watchlist-cards" }, quotes.map((item) => watchlistCard(item, item.symbol === activeQuote?.symbol, select))))),
+      h("p", { class: "world-note" }, `${data.source}. Prices may be delayed. Changes are measured against the close 5 sessions ago. For information only, not investment advice.`));
+  }
+
+  function drawModels() {
+    const data = world.data.models;
+    if (!data?.ok) return failure("models", "Model releases", data);
+    const filter = world.filters.models, all = data.items;
+    const filters = { all: () => true, new: (m) => m.is_new, major: (m) => MAJOR_LABS.has(m.lab.toLowerCase().replace(/\s+/g, "")) || MAJOR_LABS.has(m.id.split("/")[0]) };
+    const rows = all.filter(filters[filter] || filters.all);
+    const price = (m) => m.free ? " · free" : m.price_in != null && m.price_out != null ? ` · $${Number(m.price_in.toFixed(3))} in / $${Number(m.price_out.toFixed(3))} out per 1M tokens` : " · price varies";
+    put(done("models", data).body, 
+      chipRow("Filter model releases", [["all", "All", all.length], ["new", "Listed this week", all.filter(filters.new).length], ["major", "Major labs", all.filter(filters.major).length]], filter,
+        (value) => { world.filters.models = value; world.shown.models = WORLD_STEP.models; drawModels(); keepFocus(parts.models, value); }),
+      rows.length ? h("ul", { class: "feed" }, rows.slice(0, world.shown.models).map((m) => h("li", { "data-k": m.url },
+        h("p", { class: "feed-meta" }, h("span", { class: "tag" }, m.lab), m.is_new ? h("span", { class: "tag ok" }, "Newly listed") : null, m.free ? h("span", { class: "tag off" }, "Free") : null),
+        external(m.url, m.name, "feed-title"),
+        h("p", { class: "feed-meta" }, `Listed ${ago(m.released)}${m.context ? ` · ${compact(m.context)} context` : ""}${price(m)}`),
+        m.blurb ? h("p", { class: "feed-summary" }, m.blurb) : null))) : h("p", { class: "note" }, "No models match this filter."),
+      more("models", rows.length, drawModels),
+      h("p", { class: "world-note" }, "Dates are when a model appeared in OpenRouter’s catalogue. That can be later than the lab’s own announcement."));
+  }
+
+  function drawFeed(id, label, items, filterLabel, options, matches) {
+    const data = world.data[id];
+    if (!data?.ok) return failure(id, label, data);
+    const filter = options.some(([v]) => v === world.filters[id]) ? world.filters[id] : "all";
+    const repaint = id === "news" ? drawNews : drawSports;
+    const rows = items.filter((item) => matches(item, filter));
+    put(done(id, data).body, 
+      chipRow(filterLabel, options, filter, (value) => { world.filters[id] = value; world.shown[id] = WORLD_STEP[id]; repaint(); keepFocus(parts[id], value); }),
+      rows.length ? h("ul", { class: `feed${id === "sports" ? " feed-sports" : ""}` }, rows.slice(0, world.shown[id]).map((item) => h("li", { "data-k": item.url },
+        h("p", { class: "feed-meta" }, id === "sports" ? h("span", { class: "tag" }, SPORT_LABELS[item.sport] || item.sport) : null, ...(item.labs || []).map((lab) => h("span", { class: "tag" }, lab)),
+          `${item.source} · ${ago(item.published)}`),
+        external(item.url, item.title, "feed-title"),
+        item.summary ? h("p", { class: "feed-summary" }, item.summary) : null))) : h("p", { class: "note" }, "Nothing matches this filter right now."),
+      more(id, rows.length, repaint));
+  }
+
+  function drawNews() {
+    const data = world.data.news, items = data?.items || [], counts = {};
+    for (const item of items) for (const lab of item.labs || []) counts[lab] = (counts[lab] || 0) + 1;
+    const order = ["Anthropic", "OpenAI", "Google"], rank = (lab) => order.includes(lab) ? order.indexOf(lab) : 9;
+    const labs = Object.keys(counts).sort((a, b) => rank(a) - rank(b) || counts[b] - counts[a]).slice(0, 6);
+    drawFeed("news", "AI headlines", items, "Filter AI news by lab", [["all", "All", items.length], ...labs.map((lab) => [lab, lab, counts[lab]])], (item, f) => f === "all" || (item.labs || []).includes(f));
+  }
+
+  function drawSports() {
+    const items = world.data.sports?.items || [];
+    drawFeed("sports", "Sports headlines", items, "Filter sports headlines",
+      [["all", "All", items.length], ...Object.entries(SPORT_LABELS).map(([k, label]) => [k, label, items.filter((i) => i.sport === k).length])], (item, f) => f === "all" || item.sport === f);
+  }
+
+  function drawBrief() {
+    const info = world.brief, body = parts.brief.body;
+    body.removeAttribute("aria-busy");
+    if (!info) return;
+    const saved = info.saved, meter = info.budget;
+    parts.brief.meta.textContent = saved ? `Written ${ago(saved.at)}` : "";
+    const waiting = info.age != null && info.age < info.min_gap;
+    const button = h("button", { class: "btn", type: "button", disabled: world.briefBusy || waiting || !info.has_key, onclick: () => writeBrief(true) },
+      world.briefBusy ? "Writing…" : saved ? "Refresh briefing" : "Write today’s briefing");
+    const links = (refs) => {
+      const urls = refs.map((r) => saved.links?.[r]).filter(Boolean);
+      return urls.length ? h("span", { class: "refs" }, " ", urls.flatMap((url, i) => [i ? " " : "", external(url, `Source ${i + 1}`, "ref")])) : null;
+    };
+    const brief = saved?.brief;
+    put(body,
+      !info.has_key ? h("p", { class: "note" }, "Add an OpenRouter key in ", h("a", { href: "#settings" }, "Settings"), " to get a written briefing of the items below.") : null,
+      brief ? h("div", { class: "brief" },
+        brief.headline ? h("p", { class: "brief-headline" }, brief.headline) : null,
+        brief.bullets?.length ? h("ul", { class: "brief-list" }, brief.bullets.map((b) => h("li", {}, h("span", { class: "tag" }, b.topic || "Note"), " ", b.text, links(b.refs || [])))) : null,
+        brief.dropped || brief.headline_removed ? h("p", { class: "world-note" },
+          [brief.dropped ? `${brief.dropped} ${brief.dropped === 1 ? "statement was" : "statements were"} removed because ${brief.dropped === 1 ? "it" : "they"} cited no source or stated a figure that source does not contain.` : "",
+            brief.headline_removed ? "The headline was removed for the same reason." : ""].filter(Boolean).join(" ")) : null) : info.has_key && !world.briefBusy ? h("p", { class: "note" }, "No briefing yet. It is written from the headlines below by a free OpenRouter model.") : null,
+      world.briefBusy ? h("p", { class: "note", role: "status" }, "Writing the briefing from today’s headlines…") : null,
+      world.briefError ? h("p", { class: "note error", role: "alert" }, world.briefError) : null,
+      h("div", { class: "row brief-actions" }, info.has_key ? button : null,
+        h("span", { class: "world-note" }, `${saved ? `Written by ${saved.model}. ` : ""}AI can be wrong, so check the sources. ${meter.used} of ${meter.limit} AI requests used today${waiting ? "; the next refresh unlocks in a few minutes." : "."}`)));
+  }
+
+  async function writeBrief(force) {
+    world.briefBusy = true; world.briefError = ""; drawBrief();
+    try { world.brief = await api("/api/world-brief", { force }); }
+    catch (error) { world.briefError = error.message; }
+    finally { world.briefBusy = false; if (alive()) drawBrief(); }
+  }
+
+  function autoBrief() {
+    const b = world.brief;
+    if (world.briefTried || !b?.has_key || !world.data.news?.ok || !world.data.models?.ok) return;
+    if (b.saved && b.age != null && b.age < b.ttl) return;
+    if (b.budget.remaining <= b.budget.reserve) return;
+    world.briefTried = true;
+    writeBrief(false);
+  }
+
+  const draw = { markets: drawMarkets, news: drawNews, models: drawModels, sports: drawSports };
+  async function load(id, refresh) {
+    try {
+      const data = await api(`/api/world?section=${id}${refresh ? "&refresh=1" : ""}`);
+      if (!alive()) return;
+      world.data[id] = data;
+    } catch (error) {
+      if (!alive()) return;
+      if (!world.data[id]) world.data[id] = { ok: false, error: error.message };
+    }
+    draw[id]();
+    autoBrief();
+  }
+
+  show(hero, parts.markets.node, parts.brief.node, h("div", { class: "world-two" }, parts.models.node, parts.news.node), parts.sports.node,
+    h("p", { class: "note world-sources" }, "Sources: Yahoo Finance, OpenRouter, OpenAI, Google DeepMind, Hugging Face, TechCrunch, The Verge, Google News, Hacker News, ESPN, ESPNcricinfo and BBC Sport. Headlines belong to their publishers; each links to the original."));
+  WORLD_SECTIONS.forEach((id) => world.data[id] ? draw[id]() : load(id, false));
+  api("/api/world-brief").then((b) => { if (!alive()) return; world.brief = b; drawBrief(); autoBrief(); })
+    .catch(() => { if (alive()) parts.brief.body.replaceChildren(h("p", { class: "note" }, "The briefing is unavailable right now.")); });
+  const tick = () => { if (!alive()) return; WORLD_SECTIONS.forEach((id) => load(id, false)); state.timer = setTimeout(tick, 5 * 60 * 1000); };
+  state.timer = setTimeout(tick, 5 * 60 * 1000);
+}
+
 function route() {
   clearTimeout(state.timer);
   state.request++;
@@ -800,7 +1381,11 @@ function route() {
   const hash = location.hash.slice(1) || "matches";
   const tab = hash.startsWith("match/") ? "matches" : hash;
   document.querySelectorAll("nav a").forEach((a) => a.dataset.tab === tab ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
+  state.routeKey = hash;
+  state.focusHeading = state.routed === true;   // keep the natural first tab stop on the initial load
+  state.routed = true;
   if (hash.startsWith("match/")) openMatch(decodeURIComponent(hash.slice(6)));
+  else if (hash === "world") renderWorld();
   else if (hash === "f1") renderF1();
   else if (hash === "record") renderRecord();
   else if (hash === "settings") renderSettings();
@@ -810,17 +1395,20 @@ function route() {
 
 (async function start() {
   try {
-    const [app, schedule] = await Promise.all([api("/api/state"), api("/api/today-matches")]);
+    const [app, schedule] = await Promise.all([api("/api/session"), api("/api/today-matches")]);
     state.token = app.token;
     state.keyStatus = app.openrouter_key_status;
     state.schedule = schedule;
     showBudgets(schedule.budget);
   } catch (error) {
-    show(h("p", { class: "note error" }, `MatchLab could not load: ${error.message}`));
+    show(h("h1", {}, "MatchLab could not start"),
+      h("p", { class: "note error", role: "alert", style: "margin-top:14px" }, `The local server did not answer (${error.message}). Check that MatchLab is still running in its terminal window, then try again.`),
+      h("button", { class: "btn primary", type: "button", style: "margin-top:12px", onclick: () => location.reload() }, "Try again"));
     return;
   }
   window.addEventListener("hashchange", route);
   route();
   refreshSchedule();
   setInterval(() => { if (!location.hash || location.hash === "#matches") refreshSchedule(); }, 5 * 60 * 1000);
+  setInterval(updateFreshness, 30 * 1000);
 })();

@@ -311,6 +311,37 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request("GET","/api/state",headers={"Origin":"https://evil.example"})[0],403)
         self.assertEqual(self.request("POST","/api/analyze",{}, {**self.auth(),"Origin":"null"})[0],403)
 
+    def test_session_endpoint_is_small_and_carries_the_token(self):
+        code,headers,body = self.request("GET","/api/session")
+        self.assertEqual(code,200)
+        data = json.loads(body)
+        self.assertEqual(data["token"],self.server.token)
+        self.assertLess(len(body),1000)
+        self.assertEqual(headers["Cache-Control"],"no-store")
+        self.assertEqual(self.request("GET","/api/session",headers={"Host":"evil.example"})[0],403)
+
+    def test_static_files_are_revalidated_or_cached_and_security_headers_stay(self):
+        expected = {"/dash.js":"no-cache","/dash.css":"no-cache","/":"no-cache","/outfit.woff2":"public, max-age=604800, immutable"}
+        for route,cache in expected.items():
+            code,headers,body = self.request("GET",route)
+            self.assertEqual(code,200,route)
+            self.assertEqual(headers["Cache-Control"],cache,route)
+            self.assertIn("connect-src 'self'",headers["Content-Security-Policy"])
+            self.assertNotIn("*",headers["Content-Security-Policy"])
+            self.assertEqual(headers["X-Content-Type-Options"],"nosniff")
+            self.assertTrue(headers["ETag"].startswith('"'))
+            code,again,empty = self.request("GET",route,headers={"If-None-Match":headers["ETag"]})
+            self.assertEqual(code,304,route)
+            self.assertEqual(empty,b"")
+            self.assertIn("Content-Security-Policy",again)
+        self.assertEqual(self.request("GET","/dash.js",headers={"If-None-Match":'"stale"'})[0],200)
+
+    def test_api_replies_are_never_cached_and_images_cannot_escape_the_web_folder(self):
+        for route in ("/api/health","/api/today-matches"):
+            self.assertEqual(self.request("GET",route)[1]["Cache-Control"],"no-store",route)
+        for route in ("/images/../app.py","/images/%2e%2e/app.py","/images/..%5Capp.py","/images/missing.jpg"):
+            self.assertEqual(self.request("GET",route)[0],404,route)
+
     def test_invalid_config_is_transactional(self):
         original = self.server.engine
         code,_,_ = self.request("POST","/api/config",{"sports":{"football":{"data_dir":"missing-folder"}}},self.auth())
